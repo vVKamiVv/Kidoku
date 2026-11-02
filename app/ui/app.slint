@@ -1337,3 +1337,82 @@ export component AppWindow inherits Window {
         if running && go.keyed { halt.ring-focus(); } else if !running && halt.keyed { go.ring-focus(); }
     }
 }
+
+// The installer: the same program under another name, so it's the same sky over a smaller window.
+export component SetupWindow inherits Window {
+    title: "Kidoku Setup"; icon: @image-url("app-icon.png"); background: Theme.page;
+    default-font-family: Theme.ui-font; default-font-size: 14px;
+    preferred-width: 640px; preferred-height: 480px; min-width: 600px; min-height: 480px;
+
+    in-out property <string> folder;
+    in-out property <bool> desktop: true;
+    in-out property <bool> launch: true;
+    in property <bool> server-found;
+    in property <int> step; // 0 ready, 1 installing, 2 done, 3 failed
+    in property <string> status: "Ready to install.";
+
+    callback browse();
+    callback install();
+    callback finish();
+    callback get-server();
+
+    property <bool> open: step == 0 || step == 3;
+    property <int> mood: step == 1 ? 4 : step == 2 ? 1 : step == 3 ? 3 : 0;
+
+    VerticalLayout {
+        Sky {
+            phase: root.step == 2 ? 1 : root.step == 1 ? 0.5 : 0; pose: root.mood;
+            say: root.step == 2 ? "all done, GJ!  8888888" : root.step == 3 ? "oh no, read the line below" : root.step == 1 ? "" : "quiet night…";
+        }
+        VerticalLayout {
+            padding: 8px; spacing: 8px; vertical-stretch: 1;
+            Frame {
+                vertical-stretch: 1; line: Theme.frame; face: Theme.board;
+                VerticalLayout {
+                    padding: 8px; spacing: 8px; alignment: start;
+                    Post {
+                        title: "Install Kidoku"; hint: "For this Windows user, with no administrator rights.";
+                        Row {
+                            Input { text <=> root.folder; label: "Install folder"; enabled: root.open; }
+                            Button { text: "Browse…"; enabled: root.open; clicked => { root.browse(); } }
+                        }
+                        Check { text: "Add a desktop shortcut"; checked <=> root.desktop; enabled: root.open; }
+                        Check { text: "Start Kidoku when this is done"; checked <=> root.launch; enabled: root.step != 1; }
+                    }
+                    Post {
+                        title: "Ollama  ·  runs the models";
+                        hint: root.server-found ? "Found on this PC, so Kidoku is ready to pick a model." : "Kidoku translates with models that run in Ollama, a free app. You can get it now or later.";
+                        if !root.server-found: Row {
+                            alignment: start;
+                            Button { text: "Get Ollama"; clicked => { root.get-server(); } }
+                        }
+                    }
+                }
+            }
+            Frame {
+                line: Theme.frame; face: Theme.board; height: 48px;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 8px; padding-top: 6px; padding-bottom: 6px; spacing: 8px;
+                    Sticker {
+                        text: root.step == 0 ? "READY" : root.step == 1 ? "LIVE" : root.step == 2 ? "DONE" : "ERROR";
+                        state: root.mood;
+                    }
+                    Text {
+                        text: root.status; horizontal-stretch: 1; vertical-alignment: center; color: Theme.text;
+                        wrap: word-wrap; overflow: elide; accessible-live-region: polite;
+                    }
+                    Button {
+                        text: root.step == 2 ? "Finish" : root.step == 3 ? "Try again" : "Install"; kind: 1; enabled: root.step != 1;
+                        clicked => {
+                            if root.step == 2 {
+                                root.finish();
+                            } else {
+                                root.install();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

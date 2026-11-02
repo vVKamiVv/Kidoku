@@ -34,6 +34,8 @@ pub mod siglus;
 pub mod softpal;
 pub mod rgss;
 pub mod rpgmaker;
+#[cfg(windows)]
+pub mod setup;
 pub mod text;
 pub mod tyrano;
 pub mod unity;

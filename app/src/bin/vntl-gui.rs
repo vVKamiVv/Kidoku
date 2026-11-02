@@ -731,7 +731,94 @@ fn remove(ui: &AppWindow) {
     }
 }
 
+/// The window of the program named as its installer.
+#[cfg(windows)]
+fn run_setup() -> Result<(), slint::PlatformError> {
+    use vntl::setup::{default_folder, install, ollama_found, open_page, start, Choices, OLLAMA_PAGE};
+    let ui = SetupWindow::new()?;
+    ui.set_folder(default_folder().display().to_string().into());
+    ui.set_server_found(ollama_found());
+    let w = ui.as_weak();
+    ui.on_browse(move || {
+        let ui = w.unwrap();
+        pick_folder(|d| ui.set_folder(d));
+    });
+    ui.on_get_server(|| open_page(OLLAMA_PAGE));
+    let installed: Arc<Mutex<Option<PathBuf>>> = Arc::default();
+    let (w, done) = (ui.as_weak(), installed.clone());
+    ui.on_install(move || {
+        let ui = w.unwrap();
+        let choices = Choices { folder: PathBuf::from(ui.get_folder().as_str()), menu: true, desktop: ui.get_desktop(), register: true };
+        ui.set_step(1);
+        ui.set_status("Installing…".into());
+        let (w, done) = (ui.as_weak(), done.clone());
+        std::thread::spawn(move || {
+            let result = std::env::current_exe().map_err(|e| e.to_string()).and_then(|from| install(&from, &choices));
+            let _ = w.upgrade_in_event_loop(move |ui| match result {
+                Ok(program) => {
+                    *done.lock().unwrap() = Some(program);
+                    ui.set_step(2);
+                    ui.set_status("Installed. You'll find Kidoku in the Start menu.".into());
+                }
+                Err(e) => {
+                    ui.set_step(3);
+                    ui.set_status(e.into());
+                }
+            });
+        });
+    });
+    let w = ui.as_weak();
+    ui.on_finish(move || {
+        if let (true, Some(program)) = (w.unwrap().get_launch(), installed.lock().unwrap().as_ref()) {
+            let _ = start(program);
+        }
+        let _ = slint::quit_event_loop();
+    });
+    ui.run()
+}
+
+/// What `--uninstall` does, from the entry in Installed apps. `--quiet` asks nothing and keeps downloads.
+#[cfg(windows)]
+fn run_uninstall(quiet: bool) {
+    let Ok(program) = std::env::current_exe() else { return };
+    let ask = |text: &str| {
+        rfd::MessageDialog::new().set_title("Remove Kidoku").set_description(text).set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
+    };
+    if !quiet && !ask("Remove Kidoku from this PC? Games you translated keep their translation: use Remove translation in Kidoku first if you want them back in Japanese.") {
+        return;
+    }
+    let downloads = !quiet && ask("Also delete the text reader and fonts Kidoku downloaded? Models in Ollama stay either way.");
+    if let (false, Err(e)) = (quiet, vntl::setup::uninstall(&program, downloads)) {
+        rfd::MessageDialog::new().set_title("Remove Kidoku").set_description(e).show();
+    }
+}
+
+/// `--install <folder> [--files-only]` installs with no window, for a script. The exit code tells.
+#[cfg(windows)]
+fn run_quiet_install(folder: &str, files_only: bool) -> ! {
+    use vntl::setup::{install, Choices};
+    let choices = Choices { folder: folder.into(), menu: !files_only, desktop: false, register: !files_only };
+    let done = std::env::current_exe().map_err(|e| e.to_string()).and_then(|from| install(&from, &choices));
+    std::process::exit(if done.is_ok() { 0 } else { 1 })
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        if has("--uninstall") {
+            run_uninstall(has("--quiet"));
+            return Ok(());
+        }
+        if let (Some("--install"), Some(folder)) = (args.first().map(String::as_str), args.get(1)) {
+            run_quiet_install(folder, has("--files-only"));
+        }
+        let named = std::env::current_exe().ok().and_then(|p| Some(p.file_stem()?.to_string_lossy().to_lowercase()));
+        if named.is_some_and(|n| n.contains("setup")) {
+            return run_setup();
+        }
+    }
     let ui = AppWindow::new()?;
     ui.set_calm(animations_off());
     ui.set_rows(ModelRc::new(VecModel::<LogRow>::default()));

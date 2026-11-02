@@ -88,10 +88,13 @@ The [guidebook](GUIDE.md#10-what-each-engine-can-do) lists what each engine can 
 
 - Windows, the only system it's built and tested on
 - [Ollama](https://ollama.com) for the models
-- [Rust](https://rustup.rs), the current stable version
 - A GPU with about 6 GB of memory free, and about 6 GB of disk for the VN model
 
-**Build it**
+**Install it**
+
+Get **Kidoku-Setup.exe** from the [latest release](https://github.com/vVKamiVv/Kidoku/releases/latest) and run it. It installs for your Windows user and needs no administrator rights. Windows may warn about an unknown publisher, because the app isn't signed: choose **More info**, then **Run anyway**.
+
+To build it yourself instead, get [Rust](https://rustup.rs), the current stable version:
 
 ```bash
 git clone https://github.com/vVKamiVv/Kidoku.git
@@ -99,9 +102,11 @@ cd Kidoku/app
 cargo build --release
 ```
 
+Then open **Kidoku.bat**. `release.bat` in the same folder builds the release files.
+
 **Run it**
 
-1. Start Ollama, then open **Kidoku.bat**.
+1. Start Ollama, then open **Kidoku**.
 2. On the **Recommended** tab, press **Get** on the biggest text model your GPU holds. **VNTL Llama 8B** suits 8 GB.
 3. On the **Game** tab, pick the game's folder.
 4. Press **Translate**, and start the game when it says Done.

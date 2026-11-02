@@ -34,10 +34,11 @@ You'll need:
 
 - Windows, the only system it's built and tested on
 - [Ollama](https://ollama.com), which runs the models on your PC
-- [Rust](https://rustup.rs), the current stable version, to build the app
 - A GPU with about 6 GB of memory free, and about 6 GB of disk for the VN model
 
-Build it once:
+Get **Kidoku-Setup.exe** from the [latest release](https://github.com/vVKamiVv/Kidoku/releases/latest) and run it. It installs for your Windows user, with no administrator rights, and adds Kidoku to the Start menu. Windows may warn about an unknown publisher, because the app isn't signed: choose **More info**, then **Run anyway**. To remove it, use **Installed apps** in Windows Settings. Games you translated keep their translation, so use **Remove translation** first if you want them back in Japanese.
+
+To build it yourself instead, get [Rust](https://rustup.rs), the current stable version:
 
 ```bash
 git clone https://github.com/vVKamiVv/Kidoku.git
@@ -45,7 +46,9 @@ cd Kidoku/app
 cargo build --release
 ```
 
-Then start Ollama and open **Kidoku.bat**. In the app, open the **Recommended** tab and press **Get** on the biggest text model your graphics card holds. **VNTL Llama 8B** is the one for 8 GB, about 6 GB to download.
+Then open **Kidoku.bat** in place of the installed app.
+
+Start Ollama and open **Kidoku**. In the app, open the **Recommended** tab and press **Get** on the biggest text model your graphics card holds. **VNTL Llama 8B** is the one for 8 GB, about 6 GB to download.
 
 Then get two more from the same tab. They're optional, but they do jobs the translation model can't:
 
