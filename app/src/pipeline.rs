@@ -7,8 +7,8 @@ use crate::reference::{apply_reference, copy_reference_files, reference_style, s
 use crate::renpy::aliases;
 use crate::vndb::{Found, Person};
 use crate::renpy::{detect, extract, install, key, load_json, name_vars, save_json, tl_dir, Block, Cache, Dump, StringEntry};
-use crate::text::{markup_ok, same_markup, text_units, INTERP_FULL, JA, looks_like_name, MARKUP, META_REPLY, UNITY_MARKUP};
-use crate::{liar, nscripter, tyrano, fvp, softpal, artemis, kirikiri, advhd, bgi, yuris, malie, rpgmaker, unity, wolf, majiro, catsystem, reallive, qlie, siglus};
+use crate::text::{ascii_punctuation, markup_ok, same_markup, text_units, INTERP_FULL, JA, looks_like_name, MARKUP, META_REPLY, UNITY_MARKUP};
+use crate::{liar, nscripter, tyrano, fvp, softpal, artemis, kirikiri, advhd, bgi, yuris, yarn, malie, rpgmaker, unity, wolf, majiro, catsystem, reallive, qlie, siglus};
 use crate::R;
 use regex::Regex;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -780,8 +780,10 @@ fn unity_destination(t: &unity::Table, code: &str) -> bool {
 }
 
 /// Write cached Unity translations into the game. Returns a summary line.
+const NO_READER: &str = "Text over artwork needs the text reader: get it on the Recommended tab.";
+
 fn write_unity(game: &Path, lang: &str, cache: &Cache) -> R<String> {
-    let aa = unity::addressables(game).ok_or("No Unity Addressables folder (…_Data/StreamingAssets/aa) in this game")?;
+    let Some(aa) = unity::addressables(game) else { return write_yarn(game, cache) };
     let tables = unity::read_tables(&aa)?;
     let code = locale_code(lang);
     let n = unity::install(&aa, &|t, id| {
@@ -790,7 +792,7 @@ fn write_unity(game: &Path, lang: &str, cache: &Cache) -> R<String> {
             let own = tables.iter().find(|d| d.images && d.shared == t.shared && d.lang() == code);
             return (t.lang() == "ja").then(|| own?.entries.get(&id).cloned()).flatten();
         }
-        unity_destination(t, &code).then(|| cache.lines.get(&format!("{}#{id}", t.collection)).cloned()).flatten()
+        unity_destination(t, &code).then(|| cache.lines.get(&format!("{}#{id}", t.collection)).map(|s| ascii_punctuation(s))).flatten()
     })?;
     let target = tables.iter().any(|t| t.lang() == code);
     Ok(format!(
@@ -798,6 +800,13 @@ fn write_unity(game: &Path, lang: &str, cache: &Cache) -> R<String> {
          The game's Japanese setting{} now shows the translation.",
         if target { format!(" and its {lang} setting") } else { String::new() }
     ))
+}
+
+/// Yarn Spinner's text goes back into the game's own files.
+fn write_yarn(game: &Path, cache: &Cache) -> R<String> {
+    let listed = listed_names(game);
+    let n = yarn::install(game, &|k| cache.lines.get(k).cloned(), &|name| english_name(&listed, cache, name))?;
+    Ok(format!("Wrote {n} translated strings into the game's .assets files (read back OK; the originals are kept as *.vntl-orig)."))
 }
 
 /// A name corrected in the Characters list goes into the game too, over the game's own English.
@@ -812,10 +821,25 @@ fn correct_unity_names(cache: &mut Cache, sources: &[(String, String)], listed: 
 
 /// Unity games using Unity's Localization package: the game's own target-language text counts
 /// as the official translation; the model translates entries that are missing or still Japanese.
+/// A game without that package's folder goes through Yarn Spinner's table instead.
 fn translate_unity(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<()> {
     let log = |s: String| report(Event::Log(s));
-    let aa = unity::addressables(&o.game)
-        .ok_or("Only Unity games that use Unity's Localization package are supported (no …_Data/StreamingAssets/aa folder)")?;
+    let Some(aa) = unity::addressables(&o.game) else {
+        let lines = yarn::Game::open(&o.game)?.lines();
+        translate_script(o, chat, report, cancel, "Unity with Yarn Spinner", &lines, &UNITY_MARKUP, &|cache| write_yarn(&o.game, cache))?;
+        if let Some(vision) = o.vision.as_ref().filter(|_| o.art) {
+            if !crate::ocr::installed() {
+                log(NO_READER.into());
+                return Ok(());
+            }
+            log(crate::menus::translate_unity_art(&o.game, vision.as_ref(), report, cancel)?);
+            log(write_yarn(&o.game, &load_json(&cache_file(&o.game, &o.lang))?)?);
+        }
+        return Ok(());
+    };
+    if o.art {
+        log("Text over artwork only works on Unity games with Yarn Spinner so far.".into());
+    }
     let tables = unity::read_tables(&aa)?;
     let code = locale_code(&o.lang);
     let mut src: Vec<&unity::Table> = tables.iter().filter(|t| t.lang() == "ja").collect();
@@ -1478,7 +1502,7 @@ pub fn translate(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &
     if let Some(vision) = o.vision.as_ref().filter(|_| o.art) {
         match crate::ocr::installed() {
             true => log(crate::menus::translate_art(&o.game, &o.lang, vision.as_ref(), report, cancel)?),
-            false => log("Text over artwork needs the text reader: get it on the Recommended tab.".into()),
+            false => log(NO_READER.into()),
         }
     }
     Ok(())

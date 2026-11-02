@@ -303,7 +303,7 @@ pub fn keep_painted(game: &Path, images: &[(String, Vec<u8>)]) -> R<()> {
     Ok(())
 }
 
-fn painted(game: &Path) -> R<Vec<(String, Vec<u8>)>> {
+pub(crate) fn painted(game: &Path) -> R<Vec<(String, Vec<u8>)>> {
     let (dir, mut paths) = (painted_dir(game), Vec::new());
     files_under(&dir, &mut paths);
     paths.sort();

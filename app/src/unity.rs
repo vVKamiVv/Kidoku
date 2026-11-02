@@ -1,5 +1,6 @@
 //! Unity: read and rewrite UnityFS asset bundles and the serialized files inside them. Objects are
 //! walked with the type trees the bundles carry, so no game code is needed to find their strings.
+//! A file without type trees reads too, with its objects' bytes for yarn.rs to look through.
 
 use crate::{backup, files_under, original, replace_file, stamp, R};
 use std::collections::HashMap;
@@ -227,9 +228,6 @@ pub fn read_serialized(raw: Vec<u8>) -> R<Serialized> {
     }
     r.le = le;
     let (_unity, _platform, has_tree) = (r.cstr()?, r.i32()?, r.u8()? != 0);
-    if !has_tree {
-        return Err("this Unity build has no type trees".into());
-    }
     let mut types = Vec::new();
     for _ in 0..r.i32()? {
         let (class_id, _stripped, script) = (r.i32()?, r.u8()?, r.u16()? as i16);
@@ -237,6 +235,10 @@ pub fn read_serialized(raw: Vec<u8>) -> R<Serialized> {
             r.take(16)?; // script id
         }
         r.take(16)?; // type hash
+        if !has_tree {
+            types.push(Type { class_id, nodes: Vec::new() });
+            continue;
+        }
         let (count, strings) = (r.i32()? as usize, r.i32()? as usize);
         let mut fields = Vec::new();
         for _ in 0..count {

@@ -54,7 +54,7 @@
 | Engine | What gets translated | Menu images | Worth knowing |
 |---|---|---|---|
 | **Ren'Py** | Dialogue, choices and interface text | Buttons and labels on plain backgrounds, and text over artwork if you turn it on | The game starts briefly so its script can be read |
-| **Unity** | String tables | Not yet | Games that use Unity's Localization package only |
+| **Unity** | String tables, or Yarn Spinner lines, on-screen text, the game's own lists and text in its code | Yarn Spinner games: text over artwork if you turn it on | Games that use Unity's Localization package or Yarn Spinner only |
 | **Liar-soft** | Script and menus | Yes | Speakers come from the name plates, read by the text reader or an image model, and the plates are repainted in English. The engine patch needs a build with the same byte pattern |
 | **RPG Maker MV/MZ** | Messages, choices, database, menu terms and plugin text | Short images, encrypted ones too | Other plugin settings stay Japanese until they're listed |
 | **Malie** | Messages and names | Not yet | The key is found in the game's program |

@@ -256,7 +256,7 @@ pub(crate) fn write_png(img: &Image) -> R<Vec<u8>> {
 
 pub(crate) const PNG: &[u8] = b"\x89PNG";
 
-fn stored(c: &[u8]) -> u32 {
+pub(crate) fn stored(c: &[u8]) -> u32 {
     ((255 - c[3] as u32) << 24) | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32
 }
 
@@ -999,70 +999,93 @@ fn paint_over(img: &mut Image, rows: &[(Area, &String)], font: &Font) -> R<()> {
 
 /// Text painted over a Ren'Py game's artwork, for those who want it: the text reader looks through
 /// every picture, which takes a while, and the English goes over a filled-in patch, which shows.
-/// Rows found are kept, so a stopped run carries on. Characters on nothing are skipped, as they hold
-/// no text and their outlines read as letters.
 pub fn translate_art(game: &Path, lang: &str, vision: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<String> {
-    let reader = Reader::open()?;
     let mut job = Job::new(game, vision, report, cancel)?;
     let tl = tl_dir(game, lang);
     let ours_path = game.join("vntl_work").join("image_files.txt");
     let ours: BTreeSet<String> = std::fs::read_to_string(&ours_path).unwrap_or_default().lines().map(String::from).collect();
-    let rows_path = game.join("vntl_work").join("art_rows.json");
-    let mut seen: IndexMap<String, Vec<(Area, String)>> = if rows_path.exists() { load_json(&rows_path)? } else { IndexMap::new() };
     let packed = archive_files(game)?;
     let mut paths: BTreeSet<String> = packed.keys().cloned().collect();
     let (mut loose, root) = (Vec::new(), game.join("game"));
     files_under(&root, &mut loose);
     paths.extend(loose.iter().filter_map(|p| Some(p.strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/"))));
-    let wanted: Vec<&String> = paths.iter().filter(|p| {
+    let wanted: Vec<String> = paths.into_iter().filter(|p| {
         let low = p.to_lowercase();
-        is_picture(&low) && !low.starts_with("tl/") && !low.starts_with("gui/") && (ours.contains(*p) || !tl.join(p).exists())
+        is_picture(&low) && !low.starts_with("tl/") && !low.starts_with("gui/") && (ours.contains(p) || !tl.join(p).exists())
     }).collect();
-
-    report(Event::Log(format!("Looking for text over artwork in {} pictures. This can take a while.", wanted.len())));
-    for (n, path) in wanted.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("Stopped".into());
-        }
-        report(Event::Progress(n, wanted.len()));
-        if seen.contains_key(*path) {
-            continue;
-        }
-        let Some(img) = read_game_file(game, &packed, path).and_then(|d| read_picture(&d).ok()) else { continue };
-        let rows = match flat_background(&img) {
-            Some(CLEAR) => Vec::new(),
-            _ => {
-                let mut kept = Vec::new();
-                for row in reader.rows(&img)?.into_iter().filter(|r| JA.is_match(&r.1)) {
-                    if reader.agrees(&img, row.0, &row.1)? {
-                        kept.push(row);
-                    }
-                }
-                kept
-            }
-        };
-        seen.insert((*path).clone(), rows);
-        save_json(&rows_path, &seen)?;
-    }
-
-    let shown = |t: &String| t.chars().count() >= 2;
-    let texts: BTreeSet<&String> = wanted.iter().filter_map(|p| seen.get(*p)).flatten().map(|r| &r.1).filter(|t| shown(t)).collect();
-    let todo: Vec<(String, usize, String)> = texts.iter().filter(|t| !job.labels.contains_key(**t)).map(|t| ((*t).clone(), t.chars().count() * 3, "text inside a picture of the story, such as a sign or a note; ".to_string())).collect();
-    job.translate_labels("artwork", &todo)?;
-    let mut changed = Vec::new();
-    for path in &wanted {
-        let rows: Vec<(Area, &String)> = seen.get(*path).into_iter().flatten().filter_map(|(a, t)| Some((*a, job.labels.get(t)?))).collect();
-        if rows.is_empty() {
-            continue;
-        }
-        // on top of what the menu step painted, if it painted this one
-        let own = if ours.contains(*path) { std::fs::read(tl.join(path)).ok() } else { None };
-        let Some(mut img) = own.or_else(|| read_game_file(game, &packed, path)).and_then(|d| read_picture(&d).ok()) else { continue };
-        paint_over(&mut img, &rows, &job.font)?;
-        changed.push(((*path).clone(), img));
-    }
+    let read = |path: &str| read_game_file(game, &packed, path).and_then(|d| read_picture(&d).ok());
+    // on top of what the menu step painted, if it painted this one
+    let painted = |path: &str| {
+        let own = if ours.contains(path) { std::fs::read(tl.join(path)).ok() } else { None };
+        own.and_then(|d| read_picture(&d).ok()).or_else(|| read(path))
+    };
+    let changed = job.paint_art(&wanted, &read, &painted)?;
     write_overrides(&tl, &ours_path, ours, &changed)?;
     Ok(format!("Painted English over {} pictures into game/tl/{lang}/ (the game's own files are unchanged). To correct one, edit vntl_work/image_labels.txt and run again.", changed.len()))
+}
+
+/// The same for a Unity game with Yarn Spinner: what's repainted waits beside the translation, as the
+/// next write puts it in the game's files.
+pub fn translate_unity_art(game: &Path, vision: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<String> {
+    let mut job = Job::new(game, vision, report, cancel)?;
+    let g = crate::yarn::Game::open(game)?;
+    let read = |name: &str| g.picture(name);
+    let changed = job.paint_art(&g.pictures(), &read, &read)?;
+    let painted = changed.iter().map(|(name, img)| Ok((name.clone(), write_png(img)?))).collect::<R<Vec<_>>>()?;
+    artemis::keep_painted(game, &painted)?;
+    Ok(format!("Painted English over {} pictures. To correct one, edit vntl_work/image_labels.txt and run again.", painted.len()))
+}
+
+impl Job<'_> {
+    /// Looks through `wanted` for text, by what `read` gives, then paints English on what `base` gives.
+    /// Rows found are kept, so a stopped run carries on. Characters on nothing are skipped, as they
+    /// hold no text and their outlines read as letters.
+    fn paint_art(&mut self, wanted: &[String], read: &dyn Fn(&str) -> Option<Image>, base: &dyn Fn(&str) -> Option<Image>) -> R<Vec<(String, Image)>> {
+        let reader = Reader::open()?;
+        let rows_path = self.game.join("vntl_work").join("art_rows.json");
+        let mut seen: IndexMap<String, Vec<(Area, String)>> = if rows_path.exists() { load_json(&rows_path)? } else { IndexMap::new() };
+        (self.report)(Event::Log(format!("Looking for text over artwork in {} pictures. This can take a while.", wanted.len())));
+        for (n, path) in wanted.iter().enumerate() {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("Stopped".into());
+            }
+            (self.report)(Event::Progress(n, wanted.len()));
+            if seen.contains_key(path) {
+                continue;
+            }
+            let Some(img) = read(path) else { continue };
+            let rows = match flat_background(&img) {
+                Some(CLEAR) => Vec::new(),
+                _ => {
+                    let mut kept = Vec::new();
+                    for row in reader.rows(&img)?.into_iter().filter(|r| JA.is_match(&r.1)) {
+                        if reader.agrees(&img, row.0, &row.1)? {
+                            kept.push(row);
+                        }
+                    }
+                    kept
+                }
+            };
+            seen.insert(path.clone(), rows);
+            save_json(&rows_path, &seen)?;
+        }
+
+        let shown = |t: &String| t.chars().count() >= 2;
+        let texts: BTreeSet<&String> = wanted.iter().filter_map(|p| seen.get(p)).flatten().map(|r| &r.1).filter(|t| shown(t)).collect();
+        let todo: Vec<(String, usize, String)> = texts.iter().filter(|t| !self.labels.contains_key(**t)).map(|t| ((*t).clone(), t.chars().count() * 3, "text inside a picture of the story, such as a sign or a note; ".to_string())).collect();
+        self.translate_labels("artwork", &todo)?;
+        let mut changed = Vec::new();
+        for path in wanted {
+            let rows: Vec<(Area, &String)> = seen.get(path).into_iter().flatten().filter_map(|(a, t)| Some((*a, self.labels.get(t)?))).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let Some(mut img) = base(path) else { continue };
+            paint_over(&mut img, &rows, &self.font)?;
+            changed.push((path.clone(), img));
+        }
+        Ok(changed)
+    }
 }
 
 /// Images an official translation has just copied over ours stop being ours, so

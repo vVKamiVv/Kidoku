@@ -1,6 +1,6 @@
 [package]
 name = "vntl"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "GPL-3.0-only"
 
@@ -19,6 +19,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde-pickle = "1.2.0"
 serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
 slint = "1.18.1"
+texture2ddecoder = "0.1.2"
 tract-onnx = "0.23.9"
 unicode-width = "0.2.3"
 ureq = { version = "3.5.0", features = ["json"] }

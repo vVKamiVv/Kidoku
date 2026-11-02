@@ -160,7 +160,7 @@ fn offers(engine: &str) -> EngineOptions {
         scene: renpy || rpgmaker,
         scene_is_file: rpgmaker,
         images: renpy || liarsoft || rpgmaker || engine == "artemis",
-        art: renpy,
+        art: renpy || unity,
         retranslate: unity,
         redump: renpy,
         fit: vntl::fit::MEASURED.contains(&engine),
