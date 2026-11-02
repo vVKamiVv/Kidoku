@@ -38,6 +38,10 @@ You'll need:
 
 Get **Kidoku-Setup.exe** from the [latest release](https://github.com/vVKamiVv/Kidoku/releases/latest) and run it. It installs for your Windows user, with no administrator rights, and adds Kidoku to the Start menu. Windows may warn about an unknown publisher, because the app isn't signed: choose **More info**, then **Run anyway**. To remove it, use **Installed apps** in Windows Settings. Games you translated keep their translation, so use **Remove translation** first if you want them back in Japanese.
 
+When a new version is out, Kidoku says so at the top of its window. Press **Update** to download it, check it against its published checksum, and reopen in the new version, or **Later** to be reminded next time. Your settings, models and translations stay. An update can't start during a run.
+
+The check only asks GitHub what the newest version is, and sends nothing of yours. To turn it off, clear **Check for updates when Kidoku starts** at the bottom of the **Recommended** tab. **Check now** there asks whenever you like.
+
 To build it yourself instead, get [Rust](https://rustup.rs), the current stable version:
 
 ```bash

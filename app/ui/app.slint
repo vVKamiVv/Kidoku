@@ -913,6 +913,10 @@ export component AppWindow inherits Window {
     in property <[LogRow]> rows;
     in property <int> widest; // columns of the longest row
     in-out property <bool> show-lines: true; // translated lines appear in the log
+    in-out property <bool> check-updates: true;
+    in property <bool> can-update; // an installed copy, not a build run from its own folder
+    in property <string> update-version; // a newer version on offer
+    in property <string> update-note;
     in property <bool> calm; // Windows has animations turned off
 
     callback game-edited();
@@ -935,6 +939,10 @@ export component AppWindow inherits Window {
     callback add-character();
     callback remove-character(int);
     callback character-edited(int, string, string); // row, field, value
+    callback update-now();
+    callback update-later();
+    callback update-notes();
+    callback check-now();
 
     property <int> tab: 0;
     property <int> tick;
@@ -976,6 +984,21 @@ export component AppWindow inherits Window {
 
         VerticalLayout {
             padding: 8px; spacing: 8px; vertical-stretch: 1;
+
+            if root.update-version != "": Frame {
+                height: 48px; line: Theme.pink; face: Theme.board;
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 8px; padding-top: 7px; padding-bottom: 7px; spacing: 8px;
+                    Sticker { text: "NEW"; state: 4; }
+                    Text {
+                        horizontal-stretch: 1; vertical-alignment: center; color: Theme.text; overflow: elide; accessible-live-region: polite;
+                        text: "Kidoku " + root.update-version + " is out." + (root.running ? " It can install once this run is done." : "");
+                    }
+                    Button { text: "What's new"; clicked => { root.update-notes(); } }
+                    Button { text: "Later"; enabled: !root.fetching; clicked => { root.update-later(); } }
+                    Button { text: "Update"; kind: 1; enabled: !root.running && !root.fetching; clicked => { root.update-now(); } }
+                }
+            }
 
             HorizontalLayout {
                 spacing: 8px; vertical-stretch: 1;
@@ -1197,6 +1220,15 @@ export component AppWindow inherits Window {
                                             item: offer; chosen: !offer.always && offer.model == root.vision-model; busy: root.fetching || root.running;
                                             get => { root.get-model(offer.model); }
                                             pick => { root.vision-model = offer.model; }
+                                        }
+                                    }
+                                    Post {
+                                        title: "Updates";
+                                        hint: root.update-note;
+                                        Check { text: "Check for updates when Kidoku starts"; checked <=> root.check-updates; enabled: root.can-update; }
+                                        Row {
+                                            alignment: start;
+                                            Button { text: "Check now"; enabled: root.can-update && !root.fetching; clicked => { root.check-now(); } }
                                         }
                                     }
                                 }

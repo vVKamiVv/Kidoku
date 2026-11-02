@@ -151,6 +151,20 @@ pub fn uninstall(program: &Path, with_downloads: bool) -> R<()> {
     c.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Where the entry in Installed apps says Kidoku is, so that a new Setup goes to the same place.
+pub fn installed_folder() -> Option<PathBuf> {
+    location(UNINSTALL_KEY)
+}
+
+fn location(key: &str) -> Option<PathBuf> {
+    let mut c = system(r"WindowsPowerShell\v1.0\powershell.exe");
+    let script = format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8;(Get-ItemProperty -LiteralPath 'Registry::{key}' -ErrorAction Stop).InstallLocation");
+    c.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let out = c.output().ok().filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then(|| PathBuf::from(text))
+}
+
 /// Whether Ollama is on this PC: where its installer puts it, or on the path.
 pub fn ollama_found() -> bool {
     let own = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join("Programs").join("Ollama");
@@ -224,18 +238,21 @@ mod tests {
 
     #[test]
     fn the_entry_says_how_to_uninstall() {
-        let dir = temp("entry");
+        let dir = temp("エントリ");
         let program = dir.join(EXE);
         fs::write(&program, vec![0; 4096]).unwrap();
         let key = format!(r"HKCU\Software\Kidoku-test-{}", std::process::id());
         register(&key, &program).unwrap();
+        let found = location(&key);
         let out = system("reg.exe").args(["query", &key]).output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         let mut c = system("reg.exe");
         c.args(["delete", &key, "/f"]);
         run(c).unwrap();
+        assert_eq!(found.as_deref(), Some(dir.as_path()), "the way back to the folder");
+        assert_eq!(location(&key), None, "gone with the entry");
         assert!(text.contains("DisplayName") && text.contains("Kidoku"), "{text}");
-        assert!(text.contains(&format!("\"{}\" --uninstall", program.display())), "{text}");
+        assert!(text.contains(&format!("{EXE}\" --uninstall")), "{text}");
         assert!(text.contains("EstimatedSize") && text.contains("0x4"), "{text}");
         fs::remove_dir_all(dir).unwrap();
     }

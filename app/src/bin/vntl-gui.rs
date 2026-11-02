@@ -337,6 +337,7 @@ fn load_settings(ui: &AppWindow) {
     let Ok(text) = fs::read_to_string(settings_path()) else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
     let text = |key: &str| v[key].as_str().map(SharedString::from);
+    v["check_updates"].as_bool().into_iter().for_each(|on| ui.set_check_updates(on));
     let setters: [(&str, &dyn Fn(SharedString)); 6] = [
         ("url", &|s| ui.set_url(s)),
         ("model", &|s| ui.set_model(s)),
@@ -356,6 +357,7 @@ fn save_settings(ui: &AppWindow) {
     let v = serde_json::json!({
         "url": ui.get_url().as_str(), "model": ui.get_model().as_str(), "vision_model": ui.get_vision_model().as_str(),
         "lang": ui.get_lang().as_str(), "game": ui.get_game().as_str(), "reference": ui.get_reference().as_str(), "images": ui.get_images(), "history": ui.get_history(), "show_lines": ui.get_show_lines(),
+        "check_updates": ui.get_check_updates(),
     });
     // losing the remembered settings is harmless, so a failure here isn't worth interrupting anyone
     let _ = path.parent().map(fs::create_dir_all);
@@ -596,6 +598,17 @@ fn start(ui: &AppWindow, cancel: &Arc<AtomicBool>, memory: &Arc<AtomicUsize>) {
     });
 }
 
+/// Shows download progress on the bar, from another thread.
+fn progress_bar(weak: slint::Weak<AppWindow>) -> impl Fn(u64, u64) {
+    move |done: u64, total: u64| {
+        let share = done as f32 / total.max(1) as f32;
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_progress(share);
+            ui.set_percent(format!("{}%", (share * 100.0) as u32).into());
+        });
+    }
+}
+
 /// Downloads a recommended model and puts it to use. The bar shows the part being fetched: a model
 /// comes in several, and only one is big.
 fn get_model(ui: &AppWindow, model: String) {
@@ -606,14 +619,7 @@ fn get_model(ui: &AppWindow, model: String) {
     clear_progress(ui);
     ui.set_status_text(format!("Downloading {title} ({size})…").into());
     std::thread::spawn(move || {
-        let bar = weak.clone();
-        let shown = move |done: u64, total: u64| {
-            let share = done as f32 / total.max(1) as f32;
-            let _ = bar.upgrade_in_event_loop(move |ui| {
-                ui.set_progress(share);
-                ui.set_percent(format!("{}%", (share * 100.0) as u32).into());
-            });
-        };
+        let shown = progress_bar(weak.clone());
         let result = fetch(&url, &model, &shown);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_fetching(false);
@@ -734,9 +740,9 @@ fn remove(ui: &AppWindow) {
 /// The window of the program named as its installer.
 #[cfg(windows)]
 fn run_setup() -> Result<(), slint::PlatformError> {
-    use vntl::setup::{default_folder, install, ollama_found, open_page, start, Choices, OLLAMA_PAGE};
+    use vntl::setup::{default_folder, install, installed_folder, ollama_found, open_page, start, Choices, OLLAMA_PAGE};
     let ui = SetupWindow::new()?;
-    ui.set_folder(default_folder().display().to_string().into());
+    ui.set_folder(installed_folder().unwrap_or_else(default_folder).display().to_string().into());
     ui.set_server_found(ollama_found());
     let w = ui.as_weak();
     ui.on_browse(move || {
@@ -793,6 +799,98 @@ fn run_uninstall(quiet: bool) {
     }
 }
 
+/// What the new Setup does when an installed copy hands over to it: `--update <folder>`.
+/// `--no-start` leaves the new version closed and reports by exit code, for a script.
+#[cfg(windows)]
+fn run_update(folder: &str, quiet: bool) -> ! {
+    let done = std::env::current_exe().map_err(|e| e.to_string()).and_then(|from| vntl::update::replace(&from, Path::new(folder)));
+    match done {
+        Ok(program) if !quiet => {
+            let _ = vntl::setup::start(&program);
+        }
+        Ok(_) => {}
+        Err(_) if quiet => std::process::exit(1),
+        Err(e) => {
+            let text = format!("The update didn't finish, and your translations are safe. You can run the new Setup from the releases page.\n\n{e}");
+            rfd::MessageDialog::new().set_title("Update Kidoku").set_description(text).show();
+        }
+    }
+    std::process::exit(0)
+}
+
+/// Asks GitHub what's newest, for the notice. A check nobody asked for keeps quiet when it fails.
+#[cfg(windows)]
+fn check_for_update(ui: &AppWindow, found: Arc<Mutex<Option<vntl::update::Release>>>, asked: bool) {
+    let w = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = vntl::update::check();
+        let _ = w.upgrade_in_event_loop(move |ui| match result {
+            Ok(Some(release)) => {
+                ui.set_update_version(release.version.as_str().into());
+                *found.lock().unwrap() = Some(release);
+            }
+            Ok(None) if asked => ui.set_update_note(format!("Kidoku {} is the newest version.", env!("CARGO_PKG_VERSION")).into()),
+            Err(e) if asked => ui.set_update_note(format!("Couldn't ask GitHub: {e}").into()),
+            _ => {}
+        });
+    });
+}
+
+/// The notice, the setting and the button that fetches the new version and hands over to it.
+#[cfg(windows)]
+fn wire_updates(ui: &AppWindow) {
+    use vntl::update::{fetch, hand_over, installed_program, tidy, Release};
+    let found: Arc<Mutex<Option<Release>>> = Arc::default();
+    let program = installed_program();
+    ui.set_can_update(program.is_some());
+    ui.set_update_note(if program.is_some() {
+        format!("You have Kidoku {}. A check only asks GitHub what's newest, and nothing is installed until you press Update.", env!("CARGO_PKG_VERSION")).into()
+    } else {
+        "This copy runs from its own folder, so it updates with git.".into()
+    });
+    let (w, f) = (ui.as_weak(), found.clone());
+    ui.on_check_now(move || check_for_update(&w.unwrap(), f.clone(), true));
+    let w = ui.as_weak();
+    ui.on_update_later(move || w.unwrap().set_update_version("".into()));
+    let f = found.clone();
+    ui.on_update_notes(move || {
+        if let Some(release) = f.lock().unwrap().as_ref() {
+            vntl::setup::open_page(&release.page);
+        }
+    });
+    let (w, f, installed) = (ui.as_weak(), found.clone(), program.clone());
+    ui.on_update_now(move || {
+        let ui = w.unwrap();
+        let (Some(release), Some(program)) = (f.lock().unwrap().clone(), installed.clone()) else { return };
+        ui.set_fetching(true);
+        clear_progress(&ui);
+        ui.set_status_text(format!("Downloading Kidoku {}…", release.version).into());
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let shown = progress_bar(weak.clone());
+            let result = fetch(&release, &shown).and_then(|setup| hand_over(&setup, &program));
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_fetching(false);
+                clear_progress(&ui);
+                match result {
+                    // the new Setup is waiting for this copy to close
+                    Ok(()) => drop(slint::quit_event_loop()),
+                    Err(e) => {
+                        append_log(&ui, &e);
+                        ui.set_status_text("Update failed  ·  see the log below.".into());
+                    }
+                }
+            });
+        });
+    });
+    if program.is_some() {
+        tidy();
+        if ui.get_check_updates() {
+            check_for_update(ui, found, false);
+        }
+    }
+}
+
 /// `--install <folder> [--files-only]` installs with no window, for a script. The exit code tells.
 #[cfg(windows)]
 fn run_quiet_install(folder: &str, files_only: bool) -> ! {
@@ -811,8 +909,10 @@ fn main() -> Result<(), slint::PlatformError> {
             run_uninstall(has("--quiet"));
             return Ok(());
         }
-        if let (Some("--install"), Some(folder)) = (args.first().map(String::as_str), args.get(1)) {
-            run_quiet_install(folder, has("--files-only"));
+        match (args.first().map(String::as_str), args.get(1)) {
+            (Some("--install"), Some(folder)) => run_quiet_install(folder, has("--files-only")),
+            (Some("--update"), Some(folder)) => run_update(folder, has("--no-start")),
+            _ => {}
         }
         let named = std::env::current_exe().ok().and_then(|p| Some(p.file_stem()?.to_string_lossy().to_lowercase()));
         if named.is_some_and(|n| n.contains("setup")) {
@@ -946,6 +1046,8 @@ fn main() -> Result<(), slint::PlatformError> {
     detect_game(&ui, &shown);
     show_offers(&ui, &[]);
     refresh_models(&ui);
+    #[cfg(windows)]
+    wire_updates(&ui);
     let result = ui.run();
     save_typed(&ui, &shown.borrow());
     save_settings(&ui);

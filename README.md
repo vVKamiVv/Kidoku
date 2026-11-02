@@ -36,7 +36,7 @@
 ## `>>1` What it does
 
 - **Finds the engine by itself.** Pick a folder and the app tells you what the game runs on.
-- **Stays on your PC.** Text goes to your own Ollama server, and nowhere else unless you change the address. The one exception is **Import VN data from VNDB**, which you press yourself and which sends only the game's title.
+- **Stays on your PC.** Text goes to your own Ollama server, and nowhere else unless you change the address. The one exception is **Import VN data from VNDB**, which you press yourself and which sends only the game's title. At start, an installed copy also asks GitHub what the newest version is, which sends nothing of yours, and you can turn that off.
 - **Starts from what's known.** Import a synopsis, characters and descriptions from [VNDB](https://vndb.org), all editable on the Game Data tab.
 - **Picks up where it stopped.** Press **Stop** whenever you like, then **Translate** to carry on.
 - **Keeps your game safe.** Every file it changes is backed up first, and **Remove translation** puts the originals back.
@@ -103,6 +103,10 @@ cargo build --release
 ```
 
 Then open **Kidoku.bat**. `release.bat` in the same folder builds the release files.
+
+**Update it**
+
+When a new version is out, Kidoku says so at the top of its window. Press **Update** and it installs the new version and reopens. Your settings, models and translations stay.
 
 **Run it**
 

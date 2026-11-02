@@ -39,6 +39,8 @@ pub mod setup;
 pub mod text;
 pub mod tyrano;
 pub mod unity;
+#[cfg(windows)]
+pub mod update;
 pub mod usage;
 pub mod vndb;
 pub mod wolf;
@@ -265,7 +267,7 @@ pub fn restore(game: &Path) -> R<(usize, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -275,7 +277,7 @@ mod tests {
     }
 
     /// Answers one request on this machine with `body`, and gives the address.
-    fn serve(body: &'static [u8]) -> String {
+    pub(crate) fn serve(body: &'static [u8]) -> String {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let at = format!("http://{}/file", server.local_addr().unwrap());
         std::thread::spawn(move || {
