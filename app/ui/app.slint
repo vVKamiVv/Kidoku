@@ -54,7 +54,6 @@ export struct EngineOptions {
     art: bool,
     retranslate: bool,
     redump: bool,
-    language: bool,
     fit: bool, // the engine breaks its own lines, so their width can be measured
 }
 
@@ -878,7 +877,6 @@ export component AppWindow inherits Window {
     in-out property <string> url: "http://127.0.0.1:11434";
     in-out property <string> model: "gemma3:12b";
     in property <[string]> models;
-    in-out property <string> lang: "english";
     in-out property <string> label;
     in-out property <bool> retranslate;
     in-out property <bool> fresh;
@@ -1083,10 +1081,6 @@ export component AppWindow inherits Window {
                                     Post {
                                         title: "Image model  ·  menu images, names, menus";
                                         Drop { items: root.models; current: root.vision-model; label: "Image model"; list-width: parent.width; empty-text: "No models yet, see Recommended"; picked(value) => { root.vision-model = value; } }
-                                    }
-                                    if root.offers.language: Post {
-                                        title: "Language slot  ·  model writes English";
-                                        Input { text <=> root.lang; label: "Language slot in the game"; }
                                     }
                                     Post {
                                         title: "Memory  ·  VN models only";

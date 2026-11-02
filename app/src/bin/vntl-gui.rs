@@ -19,6 +19,9 @@ use vntl::renpy::{detect, game_root, tl_dir, SUPPORTED};
 use vntl::usage::Sampler;
 use vntl::R;
 
+/// The model writes English, so that's the slot in the game too. The command line can pick another.
+const LANGUAGE: &str = "english";
+
 /// The newest model list request, so a slower older reply can't overwrite its answer.
 static LAST_REFRESH: AtomicUsize = AtomicUsize::new(0);
 /// The Characters rows were changed in the window and characters.txt doesn't have that yet.
@@ -160,7 +163,6 @@ fn offers(engine: &str) -> EngineOptions {
         art: renpy,
         retranslate: unity,
         redump: renpy,
-        language: renpy || unity, // elsewhere it only names the saved translations, so it keeps working hidden
         fit: vntl::fit::MEASURED.contains(&engine),
     }
 }
@@ -338,11 +340,10 @@ fn load_settings(ui: &AppWindow) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
     let text = |key: &str| v[key].as_str().map(SharedString::from);
     v["check_updates"].as_bool().into_iter().for_each(|on| ui.set_check_updates(on));
-    let setters: [(&str, &dyn Fn(SharedString)); 6] = [
+    let setters: [(&str, &dyn Fn(SharedString)); 5] = [
         ("url", &|s| ui.set_url(s)),
         ("model", &|s| ui.set_model(s)),
         ("vision_model", &|s| ui.set_vision_model(s)),
-        ("lang", &|s| ui.set_lang(s)),
         ("game", &|s| ui.set_game(s)),
         ("reference", &|s| ui.set_reference(s)),
     ];
@@ -356,7 +357,7 @@ fn save_settings(ui: &AppWindow) {
     let path = settings_path();
     let v = serde_json::json!({
         "url": ui.get_url().as_str(), "model": ui.get_model().as_str(), "vision_model": ui.get_vision_model().as_str(),
-        "lang": ui.get_lang().as_str(), "game": ui.get_game().as_str(), "reference": ui.get_reference().as_str(), "images": ui.get_images(), "history": ui.get_history(), "show_lines": ui.get_show_lines(),
+        "game": ui.get_game().as_str(), "reference": ui.get_reference().as_str(), "images": ui.get_images(), "history": ui.get_history(), "show_lines": ui.get_show_lines(),
         "check_updates": ui.get_check_updates(),
     });
     // losing the remembered settings is harmless, so a failure here isn't worth interrupting anyone
@@ -428,11 +429,6 @@ fn pick_folder(set: impl Fn(SharedString)) {
     }
 }
 
-/// Ren'Py writes the language into `translate <lang>` statements, so it has to be one of its names.
-fn renpy_language(lang: &str) -> bool {
-    !lang.is_empty() && !lang.starts_with(|c: char| c.is_numeric()) && lang.chars().all(|c| c.is_alphanumeric() || c == '_')
-}
-
 /// A panic in the worker would skip the code that ends the run, leaving the window on "Working…".
 fn catch_panic(run: impl FnOnce() -> R<()>) -> R<()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|p| {
@@ -491,7 +487,7 @@ fn start(ui: &AppWindow, cancel: &Arc<AtomicBool>, memory: &Arc<AtomicUsize>) {
     let offered = offers(engine);
     let o = Options {
         game,
-        lang: ui.get_lang().trim().to_string(),
+        lang: LANGUAGE.to_string(),
         label: optional(ui.get_label()).filter(|_| offered.scene),
         file: None,
         reference: optional(ui.get_reference()).filter(|_| offered.reference).map(PathBuf::from),
@@ -507,11 +503,6 @@ fn start(ui: &AppWindow, cancel: &Arc<AtomicBool>, memory: &Arc<AtomicUsize>) {
         art: ui.get_art() && offered.art,
         history: memory.clone(),
     };
-    // Ren'Py itself would only reject it at the end, after all the model work
-    if engine == "renpy" && !renpy_language(&o.lang) {
-        ui.set_status_text("Target language must be one word, like english.".into());
-        return;
-    }
     // these two hold for one run, but only one that got to them: see the end of the run
     let (cache, dump) = (cache_file(&o.game, &o.lang), o.game.join("vntl_work").join("dump.json"));
     let (cache_was, dump_was) = (modified(&cache), modified(&dump));
@@ -695,7 +686,7 @@ fn remove(ui: &AppWindow) {
     if detect(&game) != "renpy" {
         return remove_backups(ui, &game);
     }
-    let tl = tl_dir(&game, ui.get_lang().trim());
+    let tl = tl_dir(&game, LANGUAGE);
     let mut files: Vec<PathBuf> = Vec::new();
     for dir in [tl.clone(), game.join("game")] {
         for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -1060,15 +1051,15 @@ mod tests {
 
     #[test]
     fn each_engine_is_offered_only_what_it_reads() {
-        // (reference, scene, images, retranslate, redump, language)
+        // (reference, scene, images, retranslate, redump)
         let row = |engine| {
             let o = offers(engine);
-            (o.reference, o.scene, o.images, o.retranslate, o.redump, o.language)
+            (o.reference, o.scene, o.images, o.retranslate, o.redump)
         };
-        assert_eq!(row("renpy"), (true, true, true, false, true, true));
-        assert_eq!(row("unity"), (false, false, false, true, false, true));
-        assert_eq!(row("liarsoft"), (false, false, true, false, false, false));
-        assert_eq!(row("rpgmaker-mv/mz"), (false, true, true, false, false, false));
+        assert_eq!(row("renpy"), (true, true, true, false, true));
+        assert_eq!(row("unity"), (false, false, false, true, false));
+        assert_eq!(row("liarsoft"), (false, false, true, false, false));
+        assert_eq!(row("rpgmaker-mv/mz"), (false, true, true, false, false));
         assert!(offers("rpgmaker-mv/mz").scene_is_file && !offers("renpy").scene_is_file);
         // no folder, or an engine the app can't translate, offers nothing of its own
         for engine in ["", "unknown", "tyranoscript", "yu-ris"] {
@@ -1151,12 +1142,6 @@ mod tests {
         let got = merged(rows.clone(), file);
         assert_eq!(got[..3], rows[..]);
         assert_eq!(got[3..], [c("ケン", "", ""), c("", "Amy", "")]);
-    }
-
-    #[test]
-    fn renpy_language_must_be_one_name() {
-        assert!(renpy_language("english") && renpy_language("pt_br"));
-        assert!(!renpy_language("") && !renpy_language("Brazilian Portuguese") && !renpy_language("1st"));
     }
 
     #[test]
