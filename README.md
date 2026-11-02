@@ -80,7 +80,7 @@ Everything from Malie down is new: checked on real games' files, but not played 
 
 The window only shows the options your game's engine can use.
 
-The [guidebook](GUIDE.md#10-what-each-engine-can-do) lists what each engine can do.
+The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do) lists what each engine can do.
 
 ## `>>3` Getting started
 
@@ -119,7 +119,7 @@ For menu images, genders and fitting text, also get the **Text reader** and an i
 
 On a GPU with 8 GB of memory, the text and image models run one after the other.
 
-The [guidebook](GUIDE.md) covers every tab and option, fixing text that doesn't fit, and what to do when something goes wrong.
+The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki) covers every tab and option, fixing text that doesn't fit, and what to do when something goes wrong.
 
 <p align="center">
   <img src="docs/tabs.png" alt="The Model and Game Data tabs" width="100%">
