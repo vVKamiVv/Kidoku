@@ -1,0 +1,1339 @@
+// Kidoku - A VN translator: "Pixel Reply". One late-night forum thread on a 2px grid: the settings are the
+// opening posts >>1 to >>4, the log is the thread that follows them, the bottom bar is the reply box,
+// and the moon waxes from crescent to full as the run advances. Colours and sizes come from the
+// kit's theme-tokens.json. Hard edges only: no radius, gradient, blur or easing anywhere.
+
+export struct CharacterRow {
+    original: string,
+    english: string,
+    gender: string,
+    extra: string, // other notes on the line (aliases, role); kept, not shown
+}
+
+// Two names the game's script treats as one character.
+export struct LinkRow {
+    original: string, // the other name as the game writes it
+    name: string,
+    main: string,
+    broken: bool, // the user has told them apart
+}
+
+// One line of the Model tab's live usage.
+export struct UsageRow {
+    label: string,
+    value: string,
+    share: float, // how full its meter is, 0 to 1; below 0 draws none
+    state: int, // a Theme state, for the meter's colour
+}
+
+// One model on the Recommended tab.
+export struct OfferRow {
+    title: string,
+    model: string,
+    size: string,
+    gpu: string,
+    note: string,
+    installed: bool,
+    always: bool, // the app's own reader: there is nothing to pick, it is used once it's here
+}
+
+// One row of the log. A translated line is one post in two rows, under one number.
+export struct LogRow {
+    time: string, // on the first row of a post
+    number: int,
+    text: string,
+    kind: int, // 0 log line, 1 Japanese, 2 its English
+}
+
+// The options the detected engine reads. Rust decides, so a run and the window can't disagree.
+export struct EngineOptions {
+    reference: bool,
+    scene: bool,
+    scene-is-file: bool, // RPG Maker picks a data file, not a label
+    images: bool,
+    art: bool,
+    retranslate: bool,
+    redump: bool,
+    language: bool,
+    fit: bool, // the engine breaks its own lines, so their width can be measured
+}
+
+global Theme {
+    out property <color> page: #151020; out property <color> board: #251c38;
+    out property <color> well: #100c1b; out property <color> raised: #322547;
+    out property <color> stripe: #1b142b; out property <color> frame: #716083;
+    out property <color> edge: #8f7da2; // functional outlines; `frame` is for decoration only
+    out property <color> text: #f3ecff; out property <color> muted: #c3b5d6;
+    out property <color> pink: #ff98c6; out property <color> pale: #ffb2d5;
+    out property <color> blue: #aec9ff; out property <color> moon: #ffe29b;
+    out property <color> ok: #9be3b2; out property <color> bad: #ff9db0;
+    out property <color> shadow: #080611;
+    out property <color> ink: #151020; // text on pastel faces
+    out property <color> focus: #aec9ff;
+    out property <color> night: #161348; // the top of the sky in sky.png
+    out property <string> ui-font: "Tahoma"; // Japanese UI faces draw the backslash in paths as a yen sign
+    out property <string> board-font: "MS PGothic"; // the kaomoji face of the era
+    out property <string> mono: "Consolas";
+
+    // Polygons on whole pixels, so they stay as sharp as the art around them.
+    out property <string> mark-ok: "M 0 3 L 2 3 L 2 4 L 3 4 L 3 5 L 4 5 L 4 4 L 5 4 L 5 3 L 6 3 L 6 2 L 7 2 L 7 1 L 8 1 L 8 0 L 9 0 L 9 2 L 8 2 L 8 3 L 7 3 L 7 4 L 6 4 L 6 5 L 5 5 L 5 6 L 4 6 L 4 7 L 3 7 L 3 6 L 2 6 L 2 5 L 1 5 L 1 4 L 0 4 Z";
+    out property <string> mark-warn: "M 3 0 L 6 0 L 6 5 L 3 5 Z M 3 6 L 6 6 L 6 8 L 3 8 Z";
+    out property <string> mark-bad: "M 0 0 L 2 0 L 2 1 L 3 1 L 3 2 L 5 2 L 5 1 L 6 1 L 6 0 L 8 0 L 8 2 L 7 2 L 7 3 L 6 3 L 6 5 L 7 5 L 7 6 L 8 6 L 8 8 L 6 8 L 6 7 L 5 7 L 5 6 L 3 6 L 3 7 L 2 7 L 2 8 L 0 8 L 0 6 L 1 6 L 1 5 L 2 5 L 2 3 L 1 3 L 1 2 L 0 2 Z";
+    out property <string> mark-live: "M 1 0 L 3 0 L 3 1 L 5 1 L 5 2 L 7 2 L 7 3 L 8 3 L 8 5 L 7 5 L 7 6 L 5 6 L 5 7 L 3 7 L 3 8 L 1 8 Z";
+    out property <string> mark-idle: "M 1 3 L 8 3 L 8 5 L 1 5 Z";
+    out property <string> mark-stop: "M 1 1 L 8 1 L 8 7 L 1 7 Z";
+
+    // state: 0 idle, 1 ok, 2 warning, 3 error, 4 live
+    public pure function state-color(state: int) -> color {
+        state == 1 ? ok : state == 2 ? moon : state == 3 ? bad : state == 4 ? pink : muted
+    }
+    public pure function state-word(state: int) -> string {
+        state == 1 ? "OK" : state == 2 ? "CHECK" : state == 3 ? "ERROR" : "WAITING"
+    }
+    public pure function state-mark(state: int) -> string {
+        state == 1 ? mark-ok : state == 2 ? mark-warn : state == 3 ? mark-bad : state == 4 ? mark-live : mark-idle
+    }
+}
+
+// Where keyboard focus just landed, so a scrolled settings page can bring it into view.
+global Seen {
+    in-out property <length> top; in-out property <length> tall;
+}
+
+component Sparkle inherits Path {
+    viewbox-width: 9; viewbox-height: 9;
+    commands: "M 4 0 L 5 0 L 5 2 L 6 2 L 6 3 L 7 3 L 7 4 L 9 4 L 9 5 L 7 5 L 7 6 L 6 6 L 6 7 L 5 7 L 5 9 L 4 9 L 4 7 L 3 7 L 3 6 L 2 6 L 2 5 L 0 5 L 0 4 L 2 4 L 2 3 L 3 3 L 3 2 L 4 2 Z";
+    fill: Theme.moon;
+}
+
+// Decoration and labels already spoken by their control's accessible-label.
+component Quiet inherits Text { vertical-alignment: center; color: Theme.muted; accessible-role: none; }
+
+// The kit's chrome: a 2px outline whose corner squares stay unpainted, hard bevel bands inside it and
+// a short hard shadow outside. Rectangles, so no renderer can soften them. x and y are set on every
+// one, or they would count towards the size of whatever a Frame holds.
+component Frame inherits Rectangle {
+    in property <color> line: Theme.frame; in property <color> face: transparent;
+    in property <color> hi: transparent; in property <color> lo: transparent;
+    in property <color> under: transparent;
+    Rectangle { x: 2px; y: root.height; width: root.width - 2px; height: 2px; background: root.under; }
+    Rectangle { x: root.width; y: 2px; width: 2px; height: root.height; background: root.under; }
+    Rectangle { x: 2px; y: 2px; width: root.width - 4px; height: root.height - 4px; background: root.face; }
+    Rectangle { x: 2px; y: 2px; width: root.width - 4px; height: 2px; background: root.hi; }
+    Rectangle { x: 2px; y: root.height - 4px; width: root.width - 4px; height: 2px; background: root.lo; }
+    Rectangle { x: 2px; y: 0px; width: root.width - 4px; height: 2px; background: root.line; }
+    Rectangle { x: 2px; y: root.height - 2px; width: root.width - 4px; height: 2px; background: root.line; }
+    Rectangle { x: 0px; y: 2px; width: 2px; height: root.height - 4px; background: root.line; }
+    Rectangle { x: root.width - 2px; y: 2px; width: 2px; height: root.height - 4px; background: root.line; }
+}
+
+// One keyboard ring for every control: 2px of blue, 2px clear of it. A negative gap draws it inside,
+// for a control at the edge of a clip. Inherits Rectangle to fill its parent:
+// a plain component would take the zero size of its children here.
+component FocusRing inherits Rectangle {
+    in property <length> gap: 2px;
+    Frame {
+        x: -root.gap - 2px; y: -root.gap - 2px; width: root.width + 2 * root.gap + 4px; height: root.height + 2 * root.gap + 4px;
+        line: Theme.focus;
+    }
+}
+
+// Pointer, Enter and Space for everything pressable; the ring is for keyboard users only.
+component Press inherits FocusScope {
+    in property <bool> on: true; in property <bool> arrow-opens;
+    out property <bool> hover: touch.has-hover && root.on;
+    out property <bool> down: touch.pressed && root.on;
+    property <bool> by-keys;
+    out property <bool> keyed: root.has-focus && by-keys;
+    callback act;
+    public function ring-focus() { by-keys = true; root.focus(); }
+
+    // Never `enabled: false` here: a disabled FocusScope still takes keys and ignores FocusOut.
+    focus-on-tab-navigation: root.on; focus-on-click: root.on;
+    focus-gained(reason) => {
+        if reason == FocusReason.tab-navigation {
+            by-keys = true;
+            Seen.tall = self.height;
+            Seen.top = self.absolute-position.y;
+        }
+    }
+    // Alt+Tab, native dialogs and popups hand focus straight back, so the ring must survive them.
+    focus-lost(reason) => { if reason != FocusReason.window-activation && reason != FocusReason.popup-activation { by-keys = false; } }
+    key-pressed(event) => {
+        if root.on && !event.repeat && (event.text == " " || event.text == Key.Return || (root.arrow-opens && event.text == Key.DownArrow)) {
+            root.act();
+            return accept;
+        }
+        reject
+    }
+    touch := TouchArea {
+        enabled: root.on; mouse-cursor: root.on ? pointer : default;
+        clicked => { root.focus(); root.act(); }
+    }
+    // Stays on a control that turned disabled while focused, or focus would vanish from the screen.
+    if root.keyed: FocusRing { }
+}
+
+// The root fills its layout cell, so the 20px label sits centred in any row.
+component Sticker {
+    in property <string> text; in property <int> state;
+    in property <string> icon: Theme.state-mark(root.state); // empty for a plain label
+    width: root.text == "" ? 21px : word.preferred-width + (root.icon != "" ? 25px : 12px); min-height: 20px;
+    Frame {
+        height: 20px; line: Theme.state-color(root.state); face: self.line;
+        if root.icon != "": Path {
+            x: 6px; y: 6px; width: 9px; height: 8px; viewbox-width: 9; viewbox-height: 8;
+            commands: root.icon; fill: Theme.ink;
+        }
+        word := Text {
+            x: root.icon != "" ? 18px : 6px; text: root.text; font-family: Theme.mono; font-size: 12px; font-weight: 700;
+            color: Theme.ink; vertical-alignment: center;
+        }
+    }
+}
+
+// kind: 0 plain, 1 pink primary, 2 gold stop, 3 ghost (it removes work, so it stays quiet until touched)
+component Button inherits Frame {
+    in property <string> text; in property <string> icon;
+    in property <bool> enabled: true; in property <int> kind: 0;
+    in property <length> text-size: 14px; in property <length> pad: 12px;
+    out property <bool> keyed: press.keyed;
+    callback clicked;
+    public function ring-focus() { press.ring-focus(); }
+
+    property <bool> bright: root.kind == 1 || root.kind == 2;
+    property <bool> ghost: root.kind == 3;
+    property <bool> live: root.enabled && !ghost;
+    property <color> top: root.kind == 1 ? Theme.pale : root.kind == 2 ? Theme.text : Theme.muted;
+    property <color> low: bright ? Theme.frame : Theme.shadow;
+    property <color> label-color: !root.enabled ? Theme.muted : ghost ? (press.hover ? Theme.bad : Theme.muted) : bright ? Theme.ink : Theme.text;
+
+    min-height: 32px; horizontal-stretch: 0; vertical-stretch: 0;
+    line: !root.enabled ? Theme.frame : bright ? Theme.shadow : ghost && press.hover ? Theme.bad : press.hover ? Theme.muted : Theme.edge;
+    face: !root.enabled ? (ghost ? transparent : Theme.raised)
+        : root.kind == 1 ? (press.hover && !press.down ? Theme.pale : Theme.pink)
+        : root.kind == 2 ? Theme.moon
+        : ghost ? (press.down ? Theme.well : press.hover ? Theme.raised : transparent)
+        : press.down ? Theme.stripe : Theme.raised;
+    hi: live ? (press.down ? low : top) : transparent;
+    lo: live ? (press.down ? top : low) : transparent;
+    under: live && !press.down ? Theme.shadow : transparent;
+    forward-focus: press; accessible-role: button; accessible-label: root.text; accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    // Pressing moves the label 1px, by padding: a layout given x or y stops sizing its button.
+    HorizontalLayout {
+        padding-left: root.pad + (press.down ? 1px : 0px); padding-right: root.pad - (press.down ? 1px : 0px);
+        padding-top: press.down ? 2px : 0px; spacing: 8px; alignment: center;
+        if root.icon != "": VerticalLayout {
+            alignment: center;
+            Path { width: 12px; height: 12px; viewbox-width: 12; viewbox-height: 12; commands: root.icon; fill: root.label-color; }
+        }
+        Quiet { text: root.text; font-size: root.text-size; font-weight: 700; color: root.label-color; }
+    }
+    press := Press { on: root.enabled; act => { root.clicked(); } }
+}
+
+component Input {
+    in-out property <string> text <=> edit.text;
+    in property <string> placeholder; in property <string> label;
+    in property <bool> enabled <=> edit.enabled;
+    in property <length> text-size: 14px;
+    out property <bool> focused: edit.has-focus;
+    callback edited(string);
+
+    min-height: 32px; horizontal-stretch: 1; vertical-stretch: 0; forward-focus: edit;
+    accessible-role: text-input; accessible-enabled: root.enabled; accessible-value: root.text;
+    accessible-label: root.label != "" ? root.label : root.placeholder;
+    accessible-placeholder-text: root.placeholder;
+    accessible-action-set-value(value) => { root.text = value; root.edited(value); }
+    changed focused => {
+        if self.focused {
+            Seen.tall = self.height;
+            Seen.top = self.absolute-position.y;
+        }
+    }
+
+    Frame {
+        line: !root.enabled ? Theme.frame : hover.has-hover ? Theme.muted : Theme.edge;
+        face: root.enabled ? Theme.well : Theme.raised;
+    }
+    // A parent TouchArea sees the hover even though the TextInput takes the clicks.
+    hover := TouchArea {
+        mouse-cursor: MouseCursor.text; enabled: root.enabled;
+        clicked => { edit.focus(); }
+        ContextMenuArea {
+            enabled: root.enabled;
+            Menu {
+                MenuItem { title: "Cut"; activated => { edit.cut(); } }
+                MenuItem { title: "Copy"; activated => { edit.copy(); } }
+                MenuItem { title: "Paste"; activated => { edit.paste(); } }
+            }
+            // Flickable, not clip: Tab skips a field inside a clip once its list scrolls it away.
+            Flickable {
+                x: 10px; width: parent.width - 14px; interactive: false;
+                content-width: self.width; content-height: self.height;
+                // TextInput cannot elide, so a long value is drawn by this Text until it is touched.
+                Quiet {
+                    x: 0px; width: parent.width - 14px; height: 100%; overflow: elide; font-size: root.text-size;
+                    text: root.text == "" && edit.preedit-text == "" ? root.placeholder : edit.has-focus ? "" : root.text;
+                    color: root.text == "" ? Theme.muted : Theme.text;
+                }
+                edit := TextInput {
+                    property <length> shift;
+                    x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.shift));
+                    width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                    height: 100%; vertical-alignment: center; single-line: true; font-size: root.text-size;
+                    color: self.has-focus ? Theme.text : transparent;
+                    selection-background-color: Theme.pink; selection-foreground-color: Theme.ink;
+                    text-cursor-width: 2px; accessible-role: none;
+                    // Same logic as the stock LineEdit: keep the caret on screen in long paths.
+                    cursor-position-changed(pos) => {
+                        if pos.x + self.shift < 0px {
+                            self.shift = -pos.x;
+                        } else if pos.x + self.shift > parent.width - self.text-cursor-width {
+                            self.shift = parent.width - pos.x - self.text-cursor-width;
+                        }
+                    }
+                    edited => { root.edited(self.text); }
+                }
+            }
+        }
+    }
+    if edit.has-focus: FocusRing { }
+}
+
+// Text that runs over several lines, in the same well as an Input.
+component TextBox {
+    in-out property <string> text <=> edit.text;
+    in property <string> placeholder; in property <string> label;
+    callback edited(string);
+
+    height: 120px; horizontal-stretch: 1; vertical-stretch: 0; forward-focus: edit;
+    accessible-role: text-input; accessible-label: root.label; accessible-value: root.text; accessible-placeholder-text: root.placeholder;
+    accessible-action-set-value(value) => { root.text = value; root.edited(value); }
+
+    Frame { line: edit.has-focus ? Theme.muted : Theme.edge; face: Theme.well; }
+    view := Flickable {
+        x: 10px; y: 6px; width: parent.width - 20px; height: parent.height - 12px;
+        content-width: self.width; content-height: max(self.height, edit.preferred-height);
+        if root.text == "": Quiet { x: 0px; y: 0px; text: root.placeholder; font-size: 13px; vertical-alignment: top; }
+        edit := TextInput {
+            x: 0px; y: 0px; width: view.width; height: view.content-height;
+            wrap: word-wrap; single-line: false; font-size: 13px; color: Theme.text;
+            selection-background-color: Theme.pink; selection-foreground-color: Theme.ink;
+            text-cursor-width: 2px; accessible-role: none;
+            changed has-focus => {
+                if self.has-focus {
+                    Seen.tall = root.height;
+                    Seen.top = root.absolute-position.y;
+                }
+            }
+            // a Flickable doesn't follow the caret by itself
+            cursor-position-changed(pos) => {
+                if pos.y + view.content-y < 0px {
+                    view.content-y = -pos.y;
+                } else if pos.y + 18px + view.content-y > view.height {
+                    view.content-y = view.height - pos.y - 18px;
+                }
+            }
+            edited => { root.edited(self.text); }
+        }
+    }
+    if edit.has-focus: FocusRing { }
+}
+
+// Slim scrollbar: `view` is the track, `full` the content, `pos` the scrolled distance.
+component Bar inherits TouchArea {
+    in property <bool> vertical;
+    in property <length> view; in property <length> full; in property <length> pos;
+    callback drag(length);
+    property <length> grip: max(28px, view * view / full);
+    property <length> start;
+    property <length> along: pos / (full - view) * (view - grip);
+    pointer-event(event) => { if event.kind == PointerEventKind.down { start = pos; } }
+    moved => {
+        drag(start + (vertical ? self.mouse-y - self.pressed-y : self.mouse-x - self.pressed-x) * (full - view) / (view - grip));
+    }
+    Rectangle {
+        x: vertical ? 3px : along; y: vertical ? along : 3px; width: vertical ? 6px : grip;
+        height: vertical ? grip : 6px;
+        background: root.has-hover || root.pressed ? Theme.focus : Theme.edge;
+    }
+}
+
+// Flickable with our own bars. Arrow, page, Home and End keys work once focused.
+component Scroller inherits FocusScope {
+    in property <length> content-w; in property <length> content-h;
+    in property <bool> follow; // a settings page: scroll to whatever gets keyboard focus
+    out property <length> offset-y: flick.content-y;
+    out property <length> view-w: flick.width; out property <length> view-h: flick.height;
+    out property <bool> more-right: -flick.content-x < max-x - 1px;
+    out property <bool> at-bottom: true; // set by scrolling, so growing content doesn't clear it
+    property <length> max-x: max(0px, content-w - flick.width); property <length> max-y: max(0px, content-h - flick.height);
+    property <length> line: 40px;
+    property <bool> by-keys;
+    property <length> seen: Seen.top;
+
+    function note-bottom() { root.at-bottom = -flick.content-y >= max-y - 1px; }
+    public function move-to(x: length, y: length) {
+        flick.content-x = -clamp(x, 0px, max-x);
+        flick.content-y = -clamp(y, 0px, max-y);
+        root.note-bottom();
+    }
+    public function to-bottom() { self.move-to(-flick.content-x, max-y); }
+    public function scroll-by(dy: length) { self.move-to(-flick.content-x, -flick.content-y - dy); }
+    // Tab does not scroll a Flickable by itself, so focused rows ask for this.
+    public function reveal(top: length, tall: length) {
+        let y = -flick.content-y;
+        self.move-to(-flick.content-x, top < y ? top : top + tall > y + flick.height ? top + tall - flick.height : y);
+    }
+    changed seen => {
+        if root.follow { root.reveal(self.seen - self.absolute-position.y + flick.content-y * -1 - 8px, Seen.tall + 16px); }
+    }
+
+    focus-on-tab-navigation: max-x > 0px || max-y > 0px;
+    focus-gained(reason) => { if reason == FocusReason.tab-navigation { by-keys = true; } }
+    focus-lost(reason) => { if reason != FocusReason.window-activation && reason != FocusReason.popup-activation { by-keys = false; } }
+    key-pressed(event) => {
+        let x = -flick.content-x;
+        let y = -flick.content-y;
+        if event.text == Key.UpArrow { self.move-to(x, y - line); }
+        else if event.text == Key.DownArrow { self.move-to(x, y + line); }
+        else if event.text == Key.LeftArrow { self.move-to(x - line, y); }
+        else if event.text == Key.RightArrow { self.move-to(x + line, y); }
+        else if event.text == Key.PageUp { self.move-to(x, y - flick.height); }
+        else if event.text == Key.PageDown { self.move-to(x, y + flick.height); }
+        else if event.text == Key.Home { self.move-to(0px, 0px); }
+        else if event.text == Key.End { self.move-to(x, max-y); }
+        else { return reject; }
+        accept
+    }
+
+    flick := Flickable {
+        content-width: max(self.width, root.content-w);
+        content-height: max(self.height, root.content-h);
+        // `flicked` fires as a wheel animation starts, before the position has moved
+        changed content-y => { root.note-bottom(); }
+        @children
+    }
+    // A hard edge says "this line goes on". Under the bars, so it never hides them.
+    if root.more-right: Rectangle { x: parent.width - self.width; width: 2px; background: Theme.frame; }
+    if max-y > 0px: Bar {
+        x: parent.width - 11px; width: 11px; vertical: true; view: flick.height; full: root.content-h;
+        pos: -flick.content-y;
+        drag(to) => { root.move-to(-flick.content-x, to); }
+    }
+    if max-x > 0px: Bar {
+        y: parent.height - 11px; height: 11px; view: flick.width; full: root.content-w; pos: -flick.content-x;
+        drag(to) => { root.move-to(to, -flick.content-y); }
+    }
+    if root.has-focus && by-keys: FocusRing { gap: -4px; }
+}
+
+// Shows `current`; the owner stores the pick, so a value set from Rust always wins.
+component Drop {
+    in property <[string]> items;
+    in property <string> current; in property <string> label;
+    in property <string> empty-text: "Nothing to pick yet";
+    in property <bool> enabled: true; in property <length> list-width; // at least this wide when open
+    callback picked(string);
+
+    property <length> row-h: 30px; property <int> marked;
+    // Rust may leave `current` empty while models exist, so "no models" needs both checks.
+    property <string> shown: root.current != "" ? root.current : root.items.length > 0 ? "Nothing chosen" : root.empty-text;
+    function show-list() { root.marked = 0; list.show(); }
+
+    min-height: 32px; horizontal-stretch: 1; vertical-stretch: 0; forward-focus: press;
+    accessible-role: combobox; accessible-label: root.label; accessible-value: root.shown; accessible-enabled: root.enabled;
+    accessible-expandable: true; accessible-expanded: list.is-open;
+    accessible-action-expand => { root.show-list(); }
+
+    Frame {
+        line: !root.enabled ? Theme.frame : press.hover ? Theme.muted : Theme.edge;
+        face: press.down ? Theme.raised : root.enabled ? Theme.well : Theme.raised;
+        HorizontalLayout {
+            padding-left: 10px; padding-right: 10px; spacing: 6px;
+            Quiet {
+                text: root.shown; horizontal-stretch: 1; overflow: elide;
+                color: root.enabled && root.current != "" ? Theme.text : Theme.muted;
+            }
+            Path {
+                y: (parent.height - 6px) / 2; width: 10px; height: 6px; viewbox-width: 10; viewbox-height: 6;
+                commands: "M 0 0 L 10 0 L 10 2 L 8 2 L 8 4 L 6 4 L 6 6 L 4 6 L 4 4 L 2 4 L 2 2 L 0 2 Z";
+                fill: root.enabled ? Theme.blue : Theme.muted;
+            }
+        }
+    }
+    press := Press { on: root.enabled; arrow-opens: true; act => { root.show-list(); } }
+    list := PopupWindow {
+        x: 0; y: root.height + 4px; width: max(root.width, root.list-width);
+        height: min(6, max(1, root.items.length)) * root.row-h + 12px;
+        close-policy: close-on-click-outside; forward-focus: keys;
+        function step(by: int) {
+            root.marked = clamp(root.marked + by, 0, root.items.length - 1);
+            rows.move-to(0px, (root.marked - 2) * root.row-h);
+        }
+        function pick() { root.picked(root.items[root.marked]); list.close(); }
+        keys := FocusScope {
+            accessible-role: AccessibleRole.list; accessible-label: root.label; accessible-delegate-focus: root.marked;
+            key-pressed(event) => {
+                if event.text == Key.UpArrow { list.step(-1); return accept; }
+                if event.text == Key.DownArrow { list.step(1); return accept; }
+                if (event.text == " " || event.text == Key.Return) && root.items.length > 0 { list.pick(); return accept; }
+                if event.text == Key.Escape { list.close(); return accept; }
+                reject
+            }
+            Frame {
+                line: Theme.edge; face: Theme.raised;
+                if root.items.length == 0: Text { text: root.empty-text; color: Theme.muted; }
+                rows := Scroller {
+                    x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+                    content-h: root.items.length * root.row-h; focus-on-tab-navigation: false;
+                    for value[i] in root.items: Rectangle {
+                        y: i * root.row-h; height: root.row-h; width: rows.view-w;
+                        // Rows are built when the popup opens: start on the current value.
+                        init => { if value == root.current { root.marked = i; rows.move-to(0px, (i - 2) * root.row-h); } }
+                        background: root.marked == i ? Theme.pink : transparent;
+                        if value == root.current: Sparkle { x: 7px; y: (parent.height - 9px) / 2; width: 9px; height: 9px; fill: root.marked == i ? Theme.ink : Theme.moon; }
+                        HorizontalLayout {
+                            padding-left: 22px; padding-right: 12px;
+                            Text { text: value; overflow: elide; vertical-alignment: center; color: root.marked == i ? Theme.ink : Theme.text; accessible-role: list-item; accessible-item-selectable: true; accessible-item-selected: value == root.current; accessible-item-index: i; }
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            changed has-hover => { if self.has-hover { root.marked = i; } }
+                            clicked => { list.pick(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component Check {
+    in property <string> text;
+    in-out property <bool> checked; in property <bool> enabled: true;
+    function toggle() { root.checked = !root.checked; }
+
+    min-height: 32px; vertical-stretch: 0; forward-focus: press;
+    accessible-role: checkbox; accessible-label: root.text; accessible-enabled: root.enabled;
+    accessible-checkable: true; accessible-checked: root.checked;
+    accessible-action-default => { root.toggle(); }
+
+    HorizontalLayout {
+        spacing: 8px;
+        Frame {
+            y: (parent.height - 18px) / 2; width: 18px; height: 18px;
+            line: !root.enabled ? Theme.frame : press.hover ? Theme.muted : Theme.edge;
+            face: !root.enabled ? Theme.raised : root.checked ? (press.hover ? Theme.pale : Theme.pink) : press.down ? Theme.raised : Theme.well;
+            if root.checked: Path {
+                x: 2px; y: 3px; width: 14px; height: 12px; viewbox-width: 14; viewbox-height: 12; fill: Theme.ink;
+                commands: "M 0 4 L 2 4 L 2 6 L 4 6 L 4 8 L 6 8 L 6 6 L 8 6 L 8 4 L 10 4 L 10 2 L 12 2 L 12 0 L 14 0 L 14 4 L 12 4 L 12 6 L 10 6 L 10 8 L 8 8 L 8 10 L 6 10 L 6 12 L 4 12 L 4 10 L 2 10 L 2 8 L 0 8 Z";
+            }
+        }
+        Quiet { text: root.text; color: root.enabled ? Theme.text : Theme.muted; }
+    }
+    press := Press { on: root.enabled; act => { root.toggle(); } }
+}
+
+// Whole steps, by arrow keys or by clicking or dragging anywhere on the track.
+component Steps {
+    in property <int> minimum; in property <int> maximum;
+    in-out property <int> value;
+    in property <string> label;
+    property <float> share: (root.value - root.minimum) / (root.maximum - root.minimum);
+    function nudge(by: int) { root.value = clamp(root.value + by, root.minimum, root.maximum); }
+    function point(x: length) {
+        root.value = clamp(round(root.minimum + x / bar.width * (root.maximum - root.minimum)), root.minimum, root.maximum);
+    }
+
+    min-height: 32px; vertical-stretch: 0; forward-focus: keys;
+    accessible-role: slider; accessible-label: root.label; accessible-value: root.value + " lines";
+    accessible-value-minimum: root.minimum; accessible-value-maximum: root.maximum; accessible-value-step: 1;
+    accessible-action-increment => { root.nudge(1); }
+    accessible-action-decrement => { root.nudge(-1); }
+
+    bar := Frame {
+        x: 9px; y: (parent.height - self.height) / 2; width: parent.width - 18px; height: 12px;
+        line: Theme.edge; face: Theme.well;
+        Rectangle { x: 2px; y: 2px; height: parent.height - 4px; width: round((parent.width - 4px) * root.share / 1px) * 1px; background: Theme.pink; }
+    }
+    Frame {
+        x: bar.x + round(bar.width * root.share / 1px) * 1px - 9px; y: (parent.height - self.height) / 2; width: 18px; height: 24px;
+        line: Theme.shadow; face: touch.has-hover && !touch.pressed ? Theme.pale : Theme.pink;
+        hi: touch.pressed ? Theme.frame : Theme.pale; lo: touch.pressed ? Theme.pale : Theme.frame;
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down { keys.focus(); root.point(self.mouse-x - bar.x); }
+        }
+        moved => { if self.pressed { root.point(self.mouse-x - bar.x); } }
+    }
+    keys := FocusScope {
+        property <bool> by-keys;
+        focus-on-click: false; // it lies over the track and would swallow the first press
+        focus-gained(reason) => {
+            self.by-keys = reason == FocusReason.tab-navigation;
+            Seen.tall = root.height;
+            Seen.top = root.absolute-position.y;
+        }
+        key-pressed(event) => {
+            if event.text == Key.RightArrow || event.text == Key.UpArrow { root.nudge(1); return accept; }
+            if event.text == Key.LeftArrow || event.text == Key.DownArrow { root.nudge(-1); return accept; }
+            reject
+        }
+        if keys.by-keys && keys.has-focus: FocusRing { }
+    }
+}
+
+// Nine drawn phases, from crescent to full, picked by how far the run has come.
+component Moon inherits Image {
+    in property <float> phase;
+    source: @image-url("moon.png"); image-rendering: pixelated; accessible-role: none;
+    source-clip-x: round(clamp(root.phase, 0, 1) * 8) * 28; source-clip-y: 0; source-clip-width: 28; source-clip-height: 28;
+}
+
+// The board's resident cat. pose: 0 sleep, 1 cheer, 2 worried, 3 alarmed, 4 awake, 5 blink
+component Cat inherits Image {
+    in property <int> pose;
+    source: @image-url("cat.png"); image-rendering: pixelated; accessible-role: none;
+    source-clip-x: root.pose * 20; source-clip-y: 0; source-clip-width: 20; source-clip-height: 18;
+}
+
+// Dark cells over a fill that follows the real number, so a part-done cell shows as part done.
+component Progress {
+    in property <float> value;
+    property <float> done: clamp(root.value, 0, 1);
+    property <length> cell: 16px;
+    min-height: 20px; max-height: 20px; accessible-role: progress-indicator;
+    accessible-label: "Translation progress"; accessible-value-minimum: 0; accessible-value-maximum: 100;
+    accessible-value: round(done * 100);
+
+    Frame {
+        line: Theme.edge; face: Theme.raised;
+        Rectangle { x: 2px; y: 2px; width: (parent.width - 4px) * root.done; height: parent.height - 4px; background: Theme.pink; }
+        for i in floor((root.width - 4px) / root.cell): Rectangle {
+            x: (i + 1) * root.cell; y: 2px; width: 2px; height: parent.height - 4px; background: Theme.well;
+        }
+    }
+}
+
+// A small on/off for the log's title row, where it can be reached during a run.
+component Switch {
+    in property <string> text; in-out property <bool> on;
+    function flip() { root.on = !root.on; }
+
+    width: word.preferred-width + 25px; min-height: 20px; forward-focus: press;
+    accessible-role: checkbox; accessible-label: root.text; accessible-checkable: true; accessible-checked: root.on;
+    accessible-action-default => { root.flip(); }
+
+    Frame {
+        height: 20px; line: root.on ? Theme.pink : press.hover ? Theme.muted : Theme.edge; face: root.on ? Theme.pink : transparent;
+        if root.on: Path {
+            x: 6px; y: 6px; width: 9px; height: 8px; viewbox-width: 9; viewbox-height: 8;
+            commands: Theme.mark-ok; fill: Theme.ink;
+        }
+        word := Text {
+            x: 18px; text: root.text; font-family: Theme.mono; font-size: 12px; font-weight: 700;
+            color: root.on ? Theme.ink : Theme.muted; vertical-alignment: center;
+        }
+    }
+    press := Press { act => { root.flip(); } }
+}
+
+// Four tabs share the panel, so the number sits over the name and a state is its mark alone.
+component Tab {
+    in property <string> number; in property <string> text;
+    in property <string> tag; // a count
+    in property <int> tag-state: 0; // a Theme state; 0 shows nothing
+    in property <bool> active;
+    callback clicked;
+
+    horizontal-stretch: 1; min-height: 36px; forward-focus: press;
+    accessible-role: tab; accessible-label: root.text;
+    accessible-value: root.tag-state != 0 ? Theme.state-word(root.tag-state) : root.tag;
+    accessible-item-selectable: true; accessible-item-selected: root.active;
+    accessible-action-default => { root.clicked(); }
+
+    Frame {
+        line: root.active ? Theme.edge : Theme.frame;
+        face: root.active || press.hover ? Theme.raised : press.down ? Theme.well : Theme.stripe;
+        lo: root.active ? Theme.pink : transparent;
+    }
+    HorizontalLayout {
+        padding-left: 8px; padding-right: 6px; spacing: 4px;
+        VerticalLayout {
+            alignment: center; horizontal-stretch: 1;
+            Quiet { text: root.number; font-family: Theme.mono; font-size: 11px; color: Theme.pink; height: 13px; }
+            Quiet { text: root.text; font-size: 13px; font-weight: 700; color: root.active ? Theme.text : Theme.muted; height: 17px; }
+        }
+        if root.tag-state != 0: Sticker { text: ""; state: root.tag-state; }
+        if root.tag != "": Sticker { text: root.tag; icon: ""; }
+    }
+    press := Press { act => { root.clicked(); } }
+}
+
+component Row inherits HorizontalLayout { spacing: 8px; }
+
+// A label in front of its control, which keeps the form short enough for a 640px window.
+component Field inherits HorizontalLayout {
+    in property <string> text;
+    spacing: 8px;
+    Quiet { text: root.text; width: 72px; }
+    @children
+}
+
+// One opening post: its subject line, an optional hint, then its fields.
+component Post inherits Frame {
+    in property <string> title; in property <string> hint;
+    line: Theme.frame;
+    VerticalLayout {
+        padding-left: 12px; padding-right: 12px; padding-top: 8px; padding-bottom: 8px; spacing: 4px;
+        Text { text: root.title.to-uppercase(); font-family: Theme.mono; font-size: 14px; font-weight: 700; color: Theme.muted; overflow: elide; }
+        if root.hint != "": Text { text: root.hint; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+        @children
+    }
+}
+
+// One model to get: what it is, what it takes, and the one thing to do about it now.
+component Offer {
+    in property <OfferRow> item; in property <bool> chosen; in property <bool> busy;
+    callback get(); callback pick();
+    VerticalLayout {
+        spacing: 6px;
+        Rectangle { height: 2px; background: Theme.frame; }
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1; spacing: 2px; alignment: start;
+                Text { text: root.item.title; font-weight: 700; color: Theme.text; overflow: elide; }
+                Text { text: root.item.size + "  ·  " + root.item.gpu; font-family: Theme.mono; font-size: 12px; color: Theme.blue; }
+                Text { text: root.item.note; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+            }
+            VerticalLayout {
+                alignment: center; horizontal-stretch: 0;
+                if !root.item.installed: Button { text: "Get"; kind: 1; enabled: !root.busy; accessible-label: "Get " + root.item.title; clicked => { root.get(); } }
+                if root.item.installed && !root.item.always && !root.chosen: Button { text: "Use"; accessible-label: "Use " + root.item.title; clicked => { root.pick(); } }
+                if root.item.installed && root.item.always: Sticker { text: "READY"; state: 1; }
+                if root.chosen: Sticker { text: "IN USE"; state: 1; }
+            }
+        }
+    }
+}
+
+// A symbol and a word beside the message, so no state depends on its colour alone.
+component Status inherits HorizontalLayout {
+    in property <string> text; in property <int> state;
+    spacing: 8px;
+    Sticker { text: Theme.state-word(root.state); state: root.state; }
+    Text { text: root.text; color: Theme.state-color(root.state); vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+}
+
+// A row of hard cells, the health bar of every fan page's visitor meter. It steps by whole cells.
+component Gauge inherits Frame {
+    in property <float> share; in property <color> fill;
+    property <int> cells: 40;
+    property <length> pitch: (root.width - 4px) / cells;
+    height: 12px; line: Theme.frame; face: Theme.well;
+    for cell in cells: Rectangle {
+        x: 2px + round(cell * root.pitch / 1px) * 1px; y: 2px; height: parent.height - 4px;
+        width: max(1px, round(root.pitch / 1px) * 1px - 1px);
+        background: (cell + 0.5) / root.cells <= root.share || (cell == 0 && root.share > 0) ? root.fill : Theme.stripe;
+    }
+}
+
+// One reading: what it is, how much, and its meter if it has one.
+component Meter {
+    in property <string> label; in property <string> value;
+    in property <float> share: -1; in property <int> state;
+    accessible-role: text; accessible-label: root.label + ": " + root.value;
+    VerticalLayout {
+        spacing: 2px;
+        HorizontalLayout {
+            spacing: 8px;
+            Quiet { text: root.label; font-family: Theme.mono; font-size: 12px; font-weight: 700; horizontal-stretch: 1; overflow: elide; }
+            Quiet { text: root.value; font-family: Theme.mono; font-size: 12px; color: Theme.text; horizontal-stretch: 0; }
+        }
+        if root.share >= 0: Gauge { share: root.share; fill: Theme.state-color(root.state); }
+    }
+}
+
+// Odometer cells, the hit counter of every fan page. Here it counts the thread's posts.
+component HitCounter inherits HorizontalLayout {
+    in property <int> value;
+    spacing: 2px;
+    Quiet { text: "POSTS"; font-family: Theme.mono; font-size: 12px; font-weight: 700; }
+    for place in 5: Frame {
+        width: 16px; line: Theme.frame; face: Theme.well;
+        Quiet { text: mod(floor(root.value / pow(10, 4 - place)), 10); font-family: Theme.mono; font-size: 13px; font-weight: 700; color: Theme.blue; horizontal-alignment: center; }
+    }
+}
+
+// Comment overlay, created while running. It steps like a <marquee>, at the five redraws a second of
+// the window's Timer. Each lane moves at one speed, so its comments can never overlap, as long as
+// each stays narrower than its slot: at the smallest window five slots are 123px each.
+component Lanes {
+    in property <int> tick;
+    in property <int> party; // redraws left of the finish moment: a faster round of applause that fades
+    property <bool> cheering: root.party > 0;
+    property <float> span: root.width / 1px + 200;
+    for comment in root.cheering ? [
+        { text: "8888888", lane: 0, at: 0.1, tint: Theme.ok },
+        { text: "GJ!!!", lane: 0, at: 0.3, tint: Theme.moon },
+        { text: "おつかれ〜", lane: 0, at: 0.5, tint: Theme.pale },
+        { text: "8888888888", lane: 0, at: 0.7, tint: Theme.ok },
+        { text: "神翻訳", lane: 0, at: 0.9, tint: Theme.pink },
+        { text: "完走おめ！", lane: 1, at: 0.0, tint: Theme.moon },
+        { text: "8888888", lane: 1, at: 0.2, tint: Theme.ok },
+        { text: "GJ  (^_^)b", lane: 1, at: 0.4, tint: Theme.text },
+        { text: "88888", lane: 1, at: 0.6, tint: Theme.ok },
+        { text: "乙です (・ω・)ﾉ", lane: 1, at: 0.8, tint: Theme.pale },
+    ] : [
+        { text: "がんばれ〜", lane: 0, at: 0.1, tint: Theme.pale },
+        { text: "GJ!!  (^_^)b", lane: 0, at: 0.3, tint: Theme.moon },
+        { text: "8888888", lane: 0, at: 0.5, tint: Theme.ok },
+        { text: "神翻訳", lane: 0, at: 0.7, tint: Theme.pink },
+        { text: "乙です (・ω・)ﾉ", lane: 0, at: 0.9, tint: Theme.text },
+        { text: "wktk (・∀・)", lane: 1, at: 0.0, tint: Theme.blue },
+        { text: "きたーーー！", lane: 1, at: 0.2, tint: Theme.text },
+        { text: "keep going~", lane: 1, at: 0.4, tint: Theme.pale },
+        { text: "wwwww", lane: 1, at: 0.6, tint: Theme.ok },
+        { text: "nice TL (^o^)/", lane: 1, at: 0.8, tint: Theme.moon },
+    ]: Text {
+        text: comment.text;
+        x: root.width - mod(root.tick * (comment.lane == 0 ? 6 : 5) * (root.cheering ? 3 : 1) + comment.at * root.span, root.span) * 1px;
+        y: comment.lane * 21px + 3px; width: self.preferred-width; height: 20px;
+        font-family: Theme.board-font; font-size: 15px; font-weight: 700; color: comment.tint; accessible-role: none;
+        // they fade before reaching the cat, never cut off
+        opacity: clamp(self.x / 48px, 0, 1) * (root.cheering ? clamp(root.party / 6, 0, 1) : 1);
+    }
+}
+
+// The view from the window. Only the moon (progress), the cat (mood) and the Lanes change, but the
+// OpenGL renderer repaints the whole window on each tick, so keep this scene cheap.
+component Sky inherits Rectangle {
+    in property <float> phase;
+    in property <int> pose; in property <int> tick; in property <int> party;
+    in property <string> say; in property <bool> comments;
+    property <length> town-x: 262px; // where the logo and its tagline end
+    property <length> tile: 800px;
+
+    height: 80px; clip: true; background: Theme.night;
+
+    // One tile sits left of town-x, so the sky carries on behind the logo.
+    for i in ceil((root.width - root.town-x) / root.tile) + 1: Image {
+        x: root.town-x + (i - 1) * root.tile; y: 0px; width: root.tile; height: 80px;
+        source: @image-url("sky.png"); image-rendering: pixelated; accessible-role: none;
+    }
+    Rectangle { x: 0px; y: 78px; height: 2px; background: Theme.frame; }
+
+    Image {
+        x: 8px; y: 8px; width: 246px; height: 58px;
+        source: @image-url("logo.png"); image-rendering: pixelated; accessible-label: "Kidoku - A VN translator";
+    }
+    // The logo's dark edge, which keeps the subtitle readable over the town.
+    for edge in [{ x: -2, y: -2 }, { x: 0, y: -2 }, { x: 2, y: -2 }, { x: -2, y: 0 }, { x: 2, y: 0 }, { x: -2, y: 2 }, { x: 0, y: 2 }, { x: 2, y: 2 }]: Text {
+        x: 84px + edge.x * 1px; y: 54px + edge.y * 1px; height: 20px; text: "A VN translator"; color: Theme.shadow;
+        vertical-alignment: center; accessible-role: none;
+    }
+    Text { x: 84px; y: 54px; height: 20px; text: "A VN translator"; color: Theme.text; vertical-alignment: center; }
+
+    if root.comments || root.party > 0: Lanes { x: root.town-x + 88px; y: 0px; width: root.width - self.x; height: 50px; tick: root.tick; party: root.party; }
+
+    // The cat on the first low roof reacts to the thread, and nothing more.
+    Cat { x: root.town-x + 30px; y: 12px; width: 40px; height: 36px; pose: root.pose; }
+    if root.say != "": Frame {
+        x: root.town-x + 80px; y: 12px; height: 28px; width: min(talk.preferred-width + 24px, root.width - self.x - 84px);
+        line: Theme.edge; face: Theme.board;
+        for step[i] in [6px, 4px, 2px]: Rectangle {
+            x: -2px * (i + 1); y: (parent.height - step) / 2; width: 2px; height: step; background: Theme.edge;
+        }
+        talk := Quiet { x: 12px; width: parent.width - 24px; text: root.say; font-size: 12px; color: Theme.text; overflow: elide; }
+    }
+
+    // Over the Lanes, which pass behind it.
+    Moon { x: parent.width - 72px; y: 12px; width: 56px; height: 56px; phase: root.phase; }
+    for star[i] in root.party > 0 ? [
+        { x: -112, y: 6, size: 18, tint: Theme.moon }, { x: -96, y: 48, size: 9, tint: Theme.text },
+        { x: -84, y: 22, size: 9, tint: Theme.pale }, { x: -30, y: 2, size: 9, tint: Theme.text },
+        { x: -8, y: 54, size: 18, tint: Theme.pale }, { x: 12, y: 10, size: 18, tint: Theme.moon },
+    ] : []: Sparkle {
+        x: root.width - 44px + star.x * 1px; y: star.y * 1px; width: star.size * 1px; height: star.size * 1px;
+        fill: star.tint; visible: mod(root.tick + i, 3) != 0;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Kidoku - A VN translator"; icon: @image-url("app-icon.png"); background: Theme.page;
+    default-font-family: Theme.ui-font; default-font-size: 14px;
+    // Height 640, not more: Slint opens at this size unclamped, and a 1080p laptop at 150% has about
+    // 641px of client area, so anything taller would open with Translate and Stop below the screen.
+    preferred-width: 1100px; preferred-height: 640px; min-width: 900px; min-height: 640px;
+
+    in-out property <string> game;
+    in-out property <string> reference;
+    in-out property <string> url: "http://127.0.0.1:11434";
+    in-out property <string> model: "gemma3:12b";
+    in property <[string]> models;
+    in-out property <string> lang: "english";
+    in-out property <string> label;
+    in-out property <bool> retranslate;
+    in-out property <bool> fresh;
+    in-out property <bool> redump;
+    in-out property <int> history: 12;
+    in-out property <bool> images: true;
+    in-out property <bool> art: false;
+    in-out property <string> vision-model;
+    in property <[CharacterRow]> characters;
+    in property <[LinkRow]> links;
+    in-out property <string> vndb-query;
+    in-out property <string> synopsis;
+    in property <bool> importing; // a VNDB import is on its way
+    in property <[string]> about-names;
+    in property <string> about-name;
+    in-out property <string> about-text;
+    in property <[UsageRow]> usage;
+    in property <string> engine-text: "No folder selected";
+    in property <int> engine-state;
+    in property <string> server-text: "Checking the model server…";
+    in property <int> server-state;
+    in property <bool> can-translate;
+    in property <bool> running;
+    in property <float> progress;
+    in property <string> status-text: "Pick a game folder to start.";
+    in property <string> percent;
+    in property <string> time-left;
+    in property <EngineOptions> offers;
+    in property <[OfferRow]> text-offers;
+    in property <[OfferRow]> image-offers;
+    in property <bool> fetching; // a model is on its way
+    in property <[LogRow]> rows;
+    in property <int> widest; // columns of the longest row
+    in-out property <bool> show-lines: true; // translated lines appear in the log
+    in property <bool> calm; // Windows has animations turned off
+
+    callback game-edited();
+    callback browse-game();
+    callback browse-reference();
+    callback refresh-models();
+    callback get-model(string);
+    callback translate();
+    callback stop();
+    callback memory-moved(int);
+    callback lines-switched(bool);
+    callback remove();
+    callback fit-box();
+    callback read-usage();
+    callback link-flipped(int);
+    callback import-vndb();
+    callback synopsis-edited(string);
+    callback about-picked(string);
+    callback about-edited(string);
+    callback add-character();
+    callback remove-character(int);
+    callback character-edited(int, string, string); // row, field, value
+
+    property <int> tab: 0;
+    property <int> tick;
+    property <int> party; // redraws left of the finish moment
+    // These only colour the mood: if the Rust wording changes, nothing else breaks.
+    property <bool> run-failed: status-text.ends-with("see the log below.");
+    property <bool> stopped: status-text.starts-with("Stopped");
+    property <bool> setup-failed: engine-state == 3 || server-state == 3;
+    property <bool> finished: status-text.starts-with("Done"); // percent stays at 100% after a run
+    property <bool> downloading: status-text.starts-with("Downloading"); // the model download sets no `running`
+    // The thread's mood: running beats error beats warning beats done beats idle.
+    property <int> mood: running || downloading ? 4 : run-failed || setup-failed ? 3 : stopped || engine-state == 2 || server-state == 2 ? 2 : finished ? 1 : 0;
+    property <string> mood-word: running || downloading ? "LIVE" : run-failed || setup-failed ? "ERROR" : stopped ? "STOPPED" : mood == 2 ? "CHECK" : finished ? "DONE" : "QUIET";
+    property <int> cat-pose: mood == 4 ? (mod(tick, 12) < 2 ? 5 : 4) : mood == 3 ? 3 : mood == 2 ? 2 : mood == 1 ? 1 : 0;
+    property <string> cat-says: running || downloading ? "" : run-failed ? "oh no, read the newest post" : setup-failed ? "one tab has an error, have a look" : stopped ? "stopped. Translate picks it up again" : mood == 2 ? "hmm? one tab wants a look" : finished ? "all done, GJ!  8888888" : "quiet night…";
+    // Only the rows on screen exist, so a whole game's lines cost no more than a screenful.
+    property <int> posts: rows.length; // rows, not posts: a translated line takes two
+    property <int> last-number: posts > 0 ? rows[posts - 1].number : 4;
+    property <length> line-h: 20px;
+    out property <int> log-columns: floor((log-view.view-w - 25px) / 7.2px); // Consolas 13px, and room for the scrollbar
+    property <length> gutter: 118px;
+    property <int> first-post: floor(-log-view.offset-y / line-h);
+    property <int> shown-posts: min(posts - first-post, ceil(log-view.view-h / line-h) + 1);
+
+    Timer {
+        interval: 200ms; running: (root.running || root.party > 0) && !root.calm;
+        triggered => { root.tick += 1; root.party = max(0, root.party - 1); }
+    }
+
+    // only while it can be seen: each reading starts a program of its own
+    Timer {
+        interval: 2s; running: root.tab == 1;
+        triggered => { root.read-usage(); }
+    }
+    changed tab => { if tab == 1 { root.read-usage(); } }
+
+    VerticalLayout {
+        Sky { phase: root.progress; pose: root.cat-pose; say: root.cat-says; comments: root.running && !root.calm; tick: root.tick; party: root.party; }
+
+        VerticalLayout {
+            padding: 8px; spacing: 8px; vertical-stretch: 1;
+
+            HorizontalLayout {
+                spacing: 8px; vertical-stretch: 1;
+
+                // Opening posts: the settings. One width for every tab, so the log edge never jumps.
+                Frame {
+                    min-width: 440px; max-width: 460px; preferred-width: 440px; horizontal-stretch: 0;
+                    line: Theme.frame; face: Theme.board;
+                    VerticalLayout {
+                        padding: 8px; spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 4px; accessible-role: tab-list;
+                            Tab { number: ">>1"; text: "Game"; tag-state: engine-state; active: tab == 0; clicked => { tab = 0; } }
+                            Tab { number: ">>2"; text: "Model"; tag-state: server-state; active: tab == 1; clicked => { tab = 1; } }
+                            Tab { number: ">>3"; text: "Game Data"; tag: characters.length > 0 ? characters.length : ""; active: tab == 2; clicked => { tab = 2; } }
+                            Tab { number: ">>4"; text: "Recommended"; active: tab == 3; clicked => { tab = 3; } }
+                        }
+                        holder := Rectangle {
+                            vertical-stretch: 1;
+
+                            // The pages reach into the panel's padding, so their scrollbar has a lane of its own.
+                            if tab == 0: game-page := Scroller {
+                                x: 0px; width: holder.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Game";
+                                content-h: game-form.preferred-height;
+                                game-form := VerticalLayout {
+                                    x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
+                                    Post {
+                                        title: "Game folder";
+                                        Row {
+                                            Input { text <=> root.game; label: "Game folder"; placeholder: "Folder that contains the game's .exe"; enabled: !root.running; edited => { root.game-edited(); } }
+                                            Button { text: "Browse…"; accessible-label: "Browse for game folder"; enabled: !root.running; clicked => { root.browse-game(); } }
+                                        }
+                                        Status { text: root.engine-text; state: root.engine-state; }
+                                    }
+                                    if root.offers.reference: Post {
+                                        title: "Official translation  ·  optional";
+                                        Row {
+                                            Input { text <=> root.reference; label: "Official translation"; placeholder: "Build of this game with an official translation"; }
+                                            Button { text: "Browse…"; accessible-label: "Browse for official translation"; clicked => { root.browse-reference(); } }
+                                        }
+                                        Text { text: "Copies the lines it has; the model translates the rest."; font-size: 12px; color: Theme.muted; wrap: word-wrap; }
+                                    }
+                                    Post {
+                                        title: "Options";
+                                        if root.offers.scene: Field {
+                                            text: root.offers.scene-is-file ? "Only file" : "Scene label";
+                                            Input {
+                                                text <=> root.label; label: root.offers.scene-is-file ? "Only this data file" : "Only this scene (label)";
+                                                placeholder: root.offers.scene-is-file ? "Empty = whole game, or e.g. Map001" : "Empty = whole game, or e.g. day_0";
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            if root.offers.images: Check { text: "Translate menu images"; checked <=> root.images; }
+                                            if root.offers.art: Check { text: "Text over artwork  ·  slow, can look edited"; checked <=> root.art; }
+                                            if root.offers.retranslate: Check { text: "Retranslate existing text"; checked <=> root.retranslate; }
+                                            Check { text: "Start over after changing characters or model"; checked <=> root.fresh; }
+                                            if root.offers.redump: Check { text: "Read script again after a game update"; checked <=> root.redump; }
+                                        }
+                                        if root.offers.fit: HorizontalLayout {
+                                            alignment: start;
+                                            Button { text: "Fit text to the box…"; accessible-label: "Measure the message box from a screenshot"; enabled: !root.running; clicked => { root.fit-box(); } }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if tab == 1: model-page := Scroller {
+                                x: 0px; width: holder.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Model";
+                                content-h: model-form.preferred-height;
+                                model-form := VerticalLayout {
+                                    x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
+                                    Post {
+                                        title: "Model";
+                                        Field { text: "Server"; Input { text <=> root.url; label: "Server"; edited => { root.refresh-models(); } } }
+                                        Field {
+                                            text: "Model";
+                                            Drop { items: root.models; current: root.model; label: "Model"; list-width: parent.width; empty-text: "No models yet, see Recommended"; picked(value) => { root.model = value; } }
+                                            Button { text: "Refresh"; clicked => { root.refresh-models(); } }
+                                        }
+                                        Status { text: root.server-text; state: root.server-state; }
+                                    }
+                                    Post {
+                                        title: "Image model  ·  menu images, names, menus";
+                                        Drop { items: root.models; current: root.vision-model; label: "Image model"; list-width: parent.width; empty-text: "No models yet, see Recommended"; picked(value) => { root.vision-model = value; } }
+                                    }
+                                    if root.offers.language: Post {
+                                        title: "Language slot  ·  model writes English";
+                                        Input { text <=> root.lang; label: "Language slot in the game"; }
+                                    }
+                                    Post {
+                                        title: "Memory  ·  VN models only";
+                                        hint: "Earlier lines the model sees, growing to twice this before it forgets the oldest. More reads better. Works during a run, on new lines; Start over redoes a game.";
+                                        Row {
+                                            Steps { minimum: 6; maximum: 24; value <=> root.history; label: "Earlier lines the model sees"; }
+                                            Quiet { text: root.history + " lines"; color: Theme.text; width: 56px; horizontal-alignment: right; }
+                                        }
+                                    }
+                                    Post {
+                                        title: "Live usage";
+                                        hint: "A model's meter shows how much of it fits on the graphics card. The card's own line counts every program.";
+                                        for row in root.usage: Meter { label: row.label; value: row.value; share: row.share; state: row.state; }
+                                    }
+                                }
+                            }
+
+                            if tab == 2: data-page := Scroller {
+                                x: 0px; width: holder.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Game Data";
+                                content-h: data-form.preferred-height;
+                                data-form := VerticalLayout {
+                                    property <length> gender-w: 100px;
+                                    property <length> remove-w: 64px;
+                                    property <length> row-h: 40px;
+                                    property <length> name-w: (cast.view-w - gender-w - remove-w - 22px - (cast.content-h > cast.view-h ? 13px : 0px)) / 2;
+                                    x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
+                                    Post {
+                                        title: "VNDB  ·  optional";
+                                        hint: "Fills in the synopsis, characters and descriptions. Only the title goes to vndb.org, and whatever is here already stays.";
+                                        Input { text <=> root.vndb-query; label: "Title or VNDB id"; placeholder: "Game title, or a VNDB id like v17"; }
+                                        HorizontalLayout {
+                                            alignment: start;
+                                            Button { text: "Import VN data from VNDB"; enabled: !root.running && !root.importing; clicked => { root.import-vndb(); } }
+                                        }
+                                    }
+                                    Post {
+                                        title: "Synopsis  ·  optional";
+                                        hint: "The model reads this with the characters, so keep it short.";
+                                        TextBox { text <=> root.synopsis; label: "Synopsis"; placeholder: "What the game is about"; edited(value) => { root.synopsis-edited(value); } }
+                                    }
+                                    Post {
+                                        title: "Characters  ·  optional";
+                                        hint: "Name in the game's language, how to write it in English, and gender, so the model gets names and pronouns right. Saved in the game's vntl_work/characters.txt.";
+                                    }
+                                    if root.characters.length > 0: HorizontalLayout {
+                                        spacing: 6px; alignment: start; padding-left: 4px;
+                                        Quiet { text: "Original name"; width: name-w; font-size: 12px; }
+                                        Quiet { text: "English name"; width: name-w; font-size: 12px; }
+                                        Quiet { text: "Gender"; font-size: 12px; }
+                                    }
+                                    // 4px spare around each row keeps focus rings out of the list's clip.
+                                    cast := Scroller {
+                                        accessible-role: list; accessible-label: "Characters";
+                                        preferred-height: min(max(self.content-h, 76px), 6 * row-h + 4px); max-height: self.preferred-height; min-height: self.preferred-height;
+                                        content-h: root.characters.length * row-h + 4px;
+                                        if root.characters.length == 0: Text {
+                                            width: cast.view-w; height: cast.view-h; text: "No characters yet (・ω・)  The whole list is optional.";
+                                            color: Theme.muted; horizontal-alignment: center; vertical-alignment: center;
+                                        }
+                                        for row[i] in root.characters: Rectangle {
+                                            x: 4px; y: i * row-h + 4px; width: cast.view-w - 4px; height: row-h - 8px;
+                                            // A game can list hundreds of names: only rows near the view exist. The margin keeps Tab going.
+                                            // shortcut: wheeling a focused row over 2 rows out of view drops its focus, no text is lost; keep the row alive while focused if users hit it.
+                                            if (i + 2) * row-h > -cast.offset-y && (i - 2) * row-h < -cast.offset-y + cast.view-h: HorizontalLayout {
+                                                spacing: 6px; alignment: start;
+                                                Input {
+                                                    text: row.original; width: name-w; label: "Original name, character " + (i + 1); placeholder: "Original name, e.g. ハナ";
+                                                    changed focused => { if self.focused { cast.reveal(i * row-h, row-h); } }
+                                                    edited(value) => { root.character-edited(i, "original", value); }
+                                                }
+                                                Input {
+                                                    text: row.english; width: name-w; label: "English name, character " + (i + 1); placeholder: "English name (optional)";
+                                                    changed focused => { if self.focused { cast.reveal(i * row-h, row-h); } }
+                                                    edited(value) => { root.character-edited(i, "english", value); }
+                                                }
+                                                Drop {
+                                                    items: ["Not set", "Female", "Male", "Non-binary"]; current: row.gender == "" ? "Not set" : row.gender; label: "Gender, character " + (i + 1); width: gender-w; list-width: 132px;
+                                                    picked(value) => { root.character-edited(i, "gender", value); }
+                                                }
+                                                Button { text: "Remove"; kind: 3; width: remove-w; text-size: 12px; pad: 4px; accessible-label: "Remove character " + (i + 1); clicked => { if self.keyed { add.ring-focus(); } else { add.focus(); } root.remove-character(i); } } // Rust rebuilds the rows, which would drop keyboard focus
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout { alignment: start; add := Button { text: "Add character"; clicked => { root.add-character(); cast.to-bottom(); } } }
+                                    if root.links.length > 0: Post {
+                                        property <length> row-h: 36px;
+                                        title: "Linked names  ·  from the game's script";
+                                        hint: "The app treats these as one character. Unlink any that aren't, then Translate.";
+                                        linked := Scroller {
+                                            height: min(root.links.length, 3) * row-h; content-h: root.links.length * row-h;
+                                            accessible-role: list; accessible-label: "Linked names";
+                                            for link[i] in root.links: Rectangle {
+                                                y: i * row-h; width: linked.view-w; height: row-h;
+                                                HorizontalLayout {
+                                                    spacing: 8px; padding-right: 14px;
+                                                    Quiet { text: link.name + (link.broken ? "  ≠  " : "  =  ") + link.main; color: link.broken ? Theme.muted : Theme.text; overflow: elide; horizontal-stretch: 1; }
+                                                    VerticalLayout {
+                                                        alignment: center;
+                                                        Button { text: link.broken ? "Link" : "Unlink"; width: 64px; text-size: 12px; pad: 4px; accessible-label: (link.broken ? "Link " : "Unlink ") + link.name + (link.broken ? " to " : " from ") + link.main; clicked => { root.link-flipped(i); } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if root.about-names.length > 0: Post {
+                                        title: "Descriptions  ·  for you, not the model";
+                                        Drop { items: root.about-names; current: root.about-name; label: "Character"; list-width: parent.width; picked(value) => { root.about-picked(value); } }
+                                        TextBox { text <=> root.about-text; label: "Description"; placeholder: "About this character"; edited(value) => { root.about-edited(value); } }
+                                    }
+                                }
+                            }
+
+                            if tab == 3: picks-page := Scroller {
+                                x: 0px; width: holder.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Recommended";
+                                content-h: picks-form.preferred-height;
+                                picks-form := VerticalLayout {
+                                    x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
+                                    Post {
+                                        title: "Text models  ·  translate the story";
+                                        hint: "All fine-tuned on visual novels. Get the largest your graphics card holds.";
+                                        for offer in root.text-offers: Offer {
+                                            item: offer; chosen: offer.model == root.model; busy: root.fetching || root.running;
+                                            get => { root.get-model(offer.model); }
+                                            pick => { root.model = offer.model; }
+                                        }
+                                    }
+                                    Post {
+                                        title: "Image models  ·  menus, names, genders";
+                                        hint: "The text reader reads labels. An image model does the rest, and these general ones can refuse adult text.";
+                                        for offer in root.image-offers: Offer {
+                                            item: offer; chosen: !offer.always && offer.model == root.vision-model; busy: root.fetching || root.running;
+                                            get => { root.get-model(offer.model); }
+                                            pick => { root.vision-model = offer.model; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // The thread: the status is its subject line, and the log is below it.
+                Frame {
+                    // An explicit minimum, or the sticker word's width would nudge this edge between states.
+                    min-width: 300px; preferred-width: 402px; horizontal-stretch: 3; line: Theme.frame; face: Theme.board;
+                    VerticalLayout {
+                        padding: 8px; spacing: 8px;
+                        HorizontalLayout {
+                            height: 24px; spacing: 6px;
+                            Text { text: "TRANSLATION LOG"; font-family: Theme.mono; font-weight: 700; color: Theme.muted; vertical-alignment: center; }
+                            Sticker { text: root.mood-word; state: mood; icon: root.stopped && mood == 2 ? Theme.mark-stop : Theme.state-mark(mood); }
+                            Rectangle { horizontal-stretch: 1; }
+                            Switch { text: "SHOW LINES"; on <=> root.show-lines; }
+                            HitCounter { value: root.last-number; accessible-role: text; accessible-label: "Posts in the thread"; accessible-value: root.last-number; }
+                        }
+                        Frame {
+                            line: Theme.frame; face: Theme.raised;
+                            VerticalLayout {
+                                padding-left: 12px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px;
+                                Text {
+                                    text: root.status-text; font-weight: 700; wrap: word-wrap; accessible-live-region: polite;
+                                    color: mood == 3 ? Theme.bad : mood == 2 ? Theme.moon : mood == 1 ? Theme.ok : Theme.text;
+                                }
+                            }
+                        }
+
+                        Frame {
+                            vertical-stretch: 1; line: Theme.edge; face: Theme.well;
+                            Rectangle {
+                                x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; clip: true;
+                                for i in root.shown-posts: Rectangle {
+                                    property <int> index: root.first-post + i;
+                                    property <LogRow> entry: root.rows[index];
+                                    property <bool> live: root.running || root.run-failed;
+                                    property <bool> newest: index == root.posts - 1;
+                                    y: index * root.line-h + log-view.offset-y + 6px;
+                                    height: root.line-h;
+                                    background: live && entry.number == root.last-number ? Theme.raised : entry.number.mod(2) == 1 ? Theme.stripe : transparent;
+                                    Quiet { x: 6px; width: 58px; height: 100%; text: parent.entry.time; font-family: Theme.mono; font-size: 12px; }
+                                    Quiet {
+                                        x: 58px; width: 54px; height: 100%; horizontal-alignment: right;
+                                        text: parent.entry.time == "" || (parent.newest && parent.live) ? "" : ">>" + parent.entry.number;
+                                        font-family: Theme.mono; font-size: 12px; color: parent.newest ? Theme.pink : Theme.blue;
+                                    }
+                                }
+                                TouchArea { x: 0px; width: root.gutter; scroll-event(e) => { log-view.scroll-by(e.delta-y); accept } }
+                                log-view := Scroller {
+                                    x: root.gutter; width: parent.width - root.gutter; accessible-role: list; accessible-label: "Translation log";
+                                    content-w: root.widest * 7.2px + 14px; content-h: root.posts * root.line-h + 12px;
+                                    for i in root.shown-posts: Text {
+                                        property <LogRow> entry: root.rows[root.first-post + i];
+                                        x: 0px; y: (root.first-post + i) * root.line-h + 6px; width: self.preferred-width; height: root.line-h;
+                                        text: self.entry.text; font-family: Theme.mono; font-size: 13px; vertical-alignment: center;
+                                        color: self.entry.kind == 1 ? Theme.muted : Theme.text;
+                                    }
+                                }
+                                // Lives in the gutter, in place of the post number, so it can never cover log text.
+                                if (root.running || root.run-failed) && root.posts > 0 && (root.posts - 1) * root.line-h + log-view.offset-y < log-view.view-h: Sticker {
+                                    x: 64px;
+                                    y: min(parent.height - 28px, (root.posts - 1) * root.line-h + log-view.offset-y + 6px + (root.line-h - self.height) / 2);
+                                    height: 20px; text: "NEW!"; icon: ""; state: root.running ? 4 : 3;
+                                }
+                                // An empty thread keeps a sticky: the first thing a new user needs to know.
+                                if root.posts == 0: Frame {
+                                    x: 12px; y: 12px; width: min(parent.width - 24px, 620px); height: sticky.preferred-height;
+                                    line: Theme.frame; face: Theme.stripe;
+                                    sticky := VerticalLayout {
+                                        padding: 12px; spacing: 6px;
+                                        HorizontalLayout {
+                                            spacing: 8px; alignment: start; height: 20px;
+                                            Sticker { text: "STICKY"; state: 2; }
+                                            Quiet { text: "Anonymous Cat"; font-weight: 700; color: Theme.ok; }
+                                            Cat { width: 20px; height: 18px; pose: 4; }
+                                        }
+                                        Text { text: "How this thread works"; font-weight: 700; color: Theme.pale; }
+                                        for step[i] in ["Pick the game folder and check its engine is OK.", "Pick a model from your model server.", "Import the game's data, or list its characters.", "No model yet? Get one here."]: HorizontalLayout {
+                                            spacing: 8px;
+                                            // Quote links jump to their post, as on any board. Keyboard users have the tabs.
+                                            Text {
+                                                text: ">>" + (i + 1); width: 24px; font-family: Theme.mono; color: Theme.blue; accessible-role: none; vertical-alignment: center;
+                                                TouchArea { mouse-cursor: pointer; clicked => { tab = i; } }
+                                            }
+                                            Text { text: step; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                        }
+                                        Text { text: "Then press Translate. Each finished line lands here as a post, and the moon fills with progress."; color: Theme.text; wrap: word-wrap; }
+                                        HorizontalLayout {
+                                            spacing: 12px; alignment: start;
+                                            Image { width: 88px; height: 31px; source: @image-url("badge.png"); image-rendering: pixelated; accessible-label: "Kidoku, local model"; }
+                                            Quiet { text: "best viewed at night with a warm GPU (^_^)"; font-size: 12px; font-italic: true; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The reply box: always on screen
+            Frame {
+                height: 56px; line: Theme.frame; face: Theme.board;
+                HorizontalLayout {
+                    padding: 8px; spacing: 8px;
+                    go := Button { width: 142px; kind: 1; text: "Translate"; text-size: 16px; icon: "M 0 0 L 2 0 L 2 1 L 4 1 L 4 2 L 6 2 L 6 3 L 8 3 L 8 4 L 10 4 L 10 5 L 12 5 L 12 7 L 10 7 L 10 8 L 8 8 L 8 9 L 6 9 L 6 10 L 4 10 L 4 11 L 2 11 L 2 12 L 0 12 Z"; enabled: root.can-translate && !root.running && !root.fetching; clicked => { root.translate(); } }
+                    halt := Button { width: 96px; kind: 2; text: "Stop"; text-size: 14px; icon: "M 1 1 L 11 1 L 11 11 L 1 11 Z"; enabled: root.running; clicked => { root.stop(); } }
+                    VerticalLayout {
+                        horizontal-stretch: 1; padding-left: 4px; alignment: center;
+                        Progress { value: root.progress; }
+                    }
+                    VerticalLayout {
+                        width: 136px; alignment: center;
+                        Text { text: root.percent; font-family: Theme.mono; font-size: 13px; color: Theme.text; horizontal-alignment: right; }
+                        if root.time-left != "": Text { text: root.time-left; font-size: 12px; color: Theme.muted; horizontal-alignment: right; }
+                    }
+                    Button { kind: 3; text: "Remove translation"; enabled: !root.running; clicked => { root.remove(); } }
+                }
+            }
+        }
+    }
+
+    // Keep the newest log lines in view. Scrolling up stops that until the end is reached again.
+    // Hiding the translated lines can leave the view past the end, so that goes to the bottom too.
+    changed posts => { if log-view.at-bottom || first-post >= posts { log-view.to-bottom(); } }
+    changed history => { root.memory-moved(history); }
+    changed show-lines => { root.lines-switched(show-lines); }
+    changed finished => { if finished && !calm { party = 30; } }
+    // A disabled button keeps focus but ignores keys, so the ring moves to the one that works now.
+    // A new run always shows its first lines, wherever the last one was left scrolled to.
+    changed running => {
+        if running { log-view.to-bottom(); }
+        if running && go.keyed { halt.ring-focus(); } else if !running && halt.keyed { go.ring-focus(); }
+    }
+}

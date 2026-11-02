@@ -1,0 +1,27 @@
+[package]
+name = "vntl"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+encoding_rs = "0.8.42"
+flate2 = "1.1.10"
+fontdue = "0.9.5"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "webp"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+lz4_flex = "0.14.0"
+png = "0.18.1"
+regex = "1.13.1"
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde-pickle = "1.2.0"
+serde_json = { version = "1.0.154", features = ["preserve_order", "float_roundtrip"] }
+slint = "1.18.1"
+tract-onnx = "0.23.9"
+unicode-width = "0.2.3"
+ureq = { version = "3.5.0", features = ["json"] }
+
+[build-dependencies]
+slint-build = "1.18.1"

@@ -1,0 +1,5 @@
+# Cargo's build output
+/app/target/
+
+# Screenshots of the old look
+/app_*.png
