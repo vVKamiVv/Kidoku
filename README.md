@@ -49,6 +49,12 @@
 - **Shows what it's using.** The Model tab lists the app's and each model's VRAM, RAM and CPU, live.
 - **Recommends models.** The Recommended tab lists text and image models from 4 GB to 24 GB of graphics memory, a click to download.
 
+<p align="center">
+  <img src="docs/showcase-ja.webp" alt="A scene as the game ships it, in Japanese" width="49%">
+  <img src="docs/showcase-en.webp" alt="The same scene after Kidoku, in English" width="49%">
+</p>
+<p align="center"><sub>Born Freaks! By Liar-Soft</sub></p>
+
 ## `>>2` Supported engines
 
 | Engine | What gets translated | Menu images | Worth knowing |
