@@ -780,7 +780,7 @@ fn unity_destination(t: &unity::Table, code: &str) -> bool {
 }
 
 /// Write cached Unity translations into the game. Returns a summary line.
-const NO_READER: &str = "Text over artwork needs the text reader: get it on the Recommended tab.";
+const NO_READER: &str = "Text over artwork needs the text reader, from Model Download.";
 
 fn write_unity(game: &Path, lang: &str, cache: &Cache) -> R<String> {
     let Some(aa) = unity::addressables(game) else { return write_yarn(game, cache) };
@@ -1005,7 +1005,7 @@ fn plate_names(o: &Options, log: &dyn Fn(String)) -> R<HashMap<String, String>> 
     let reader = (!plates.is_empty()).then(Reader::open).and_then(Result::ok);
     let vision = o.vision.as_deref().map(|v| v as &dyn Chat);
     if !plates.is_empty() && reader.is_none() && vision.is_none() {
-        log("Liar-soft: speakers stay unknown to the model. Get the text reader on the Recommended tab, or pick an image model.".into());
+        log("Liar-soft: speakers stay unknown to the model. Get the text reader from Model Download, or pick an image model.".into());
         return Ok(HashMap::new());
     }
     let mut names = HashMap::new();

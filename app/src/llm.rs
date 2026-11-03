@@ -225,7 +225,7 @@ pub fn translate_vntl(chat: &dyn Chat, markup: &Regex, meta: &[String], history:
 /// The model fine-tuned on visual novels that the app recommends.
 pub const VN_MODEL: &str = "hf.co/lmg-anon/vntl-llama3-8b-v2-gguf:Q5_K_M";
 
-/// One model on the Recommended tab.
+/// One model on the Model Download page.
 pub struct Offer {
     pub title: &'static str,
     pub model: &'static str,
@@ -258,7 +258,7 @@ pub const IMAGE_OFFERS: [Offer; 6] = [
     Offer { title: "Qwen 3.5 27B", model: "qwen3.5:27b", size: "17.5 GB", gpu: "GPU 24 GB", note: "For big GPUs. Not tested with this app yet." },
 ];
 
-/// Whether a row of the Recommended tab is the app's own, with nothing to pick and no server involved.
+/// Whether a row of Model Download is the app's own, with nothing to pick and no server involved.
 pub fn is_own(model: &str) -> bool {
     model == TEXT_READER || model == FONT_PACK
 }
@@ -267,7 +267,7 @@ pub fn own_installed(model: &str) -> bool {
     if model == FONT_PACK { crate::fonts::installed() } else { crate::ocr::installed() }
 }
 
-/// Gets what a row of the Recommended tab offers.
+/// Gets what a row of Model Download offers.
 pub fn fetch(url: &str, model: &str, progress: &dyn Fn(u64, u64)) -> R<()> {
     match model {
         TEXT_READER => crate::ocr::download(progress),

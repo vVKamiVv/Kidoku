@@ -127,7 +127,7 @@ impl Reader {
     /// Loads the models, which takes about a second. Err if they aren't installed.
     pub fn open() -> R<Self> {
         if !installed() {
-            return Err("the text reader isn't installed: get it on the Recommended tab".into());
+            return Err("the text reader isn't installed: get it from Model Download".into());
         }
         let load = |file, shape| plan(file, shape).map_err(|e| format!("{file}: {e}"));
         Ok(Reader { finder: load(FINDER, PAGE)?, reader: load(READER, ROW)? })

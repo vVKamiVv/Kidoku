@@ -396,7 +396,7 @@ fn refresh_models(ui: &AppWindow) {
     });
 }
 
-/// The Recommended rows, given the models the server has. A row carries the name the server uses,
+/// The Model Download rows, given the models the server has. A row carries the name the server uses,
 /// which is the one the model boxes hold.
 fn offer_rows(offers: &[Offer], ids: &[String]) -> ModelRc<OfferRow> {
     let rows: Vec<OfferRow> = offers
@@ -457,7 +457,7 @@ fn read_usage(ui: &AppWindow, sampler: Arc<Mutex<Sampler>>) {
 /// Asks for a screenshot of a long line, and measures the box from it.
 fn fit_box(ui: &AppWindow) {
     if ui.get_vision_model().is_empty() && !vntl::ocr::installed() {
-        ui.set_status_text("Fitting text needs the text reader or an image model: see the Recommended tab.".into());
+        ui.set_status_text("Fitting text needs the text reader or an image model, from Model Download.".into());
         return;
     }
     let dialog = rfd::FileDialog::new().set_title("Choose a screenshot of a long message").add_filter("Screenshot", &["png", "jpg", "jpeg"]);
@@ -655,7 +655,7 @@ fn remove_backups(ui: &AppWindow, game: &Path) {
                          Their older originals are kept as *.vntl-orig.old-N."
                     ));
                 }
-                ui.set_status_text("Translation removed  ·  the game shows its original text again.".into());
+                ui.set_status_text("Translation removed.".into());
                 clear_progress(ui);
             }
             Err(e) => append_log(ui, &e),
@@ -721,7 +721,7 @@ fn remove(ui: &AppWindow) {
             clear_progress(ui);
         }
         ui.set_status_text(if failed.is_empty() {
-            "Translation removed  ·  the game shows its original text again.".into()
+            "Translation removed.".into()
         } else {
             format!("Could not remove {} file(s)  ·  see the log below.", failed.len()).into()
         });
@@ -818,9 +818,10 @@ fn check_for_update(ui: &AppWindow, found: Arc<Mutex<Option<vntl::update::Releas
         let _ = w.upgrade_in_event_loop(move |ui| match result {
             Ok(Some(release)) => {
                 ui.set_update_version(release.version.as_str().into());
+                ui.set_news(release.notes.as_str().into());
                 *found.lock().unwrap() = Some(release);
             }
-            Ok(None) if asked => ui.set_update_note(format!("Kidoku {} is the newest version.", env!("CARGO_PKG_VERSION")).into()),
+            Ok(None) if asked => ui.set_update_note("You're up to date.".into()),
             Err(e) if asked => ui.set_update_note(format!("Couldn't ask GitHub: {e}").into()),
             _ => {}
         });
@@ -834,19 +835,17 @@ fn wire_updates(ui: &AppWindow) {
     let found: Arc<Mutex<Option<Release>>> = Arc::default();
     let program = installed_program();
     ui.set_can_update(program.is_some());
-    ui.set_update_note(if program.is_some() {
-        format!("You have Kidoku {}. A check only asks GitHub what's newest, and nothing is installed until you press Update.", env!("CARGO_PKG_VERSION")).into()
-    } else {
-        "This copy runs from its own folder, so it updates with git.".into()
-    });
+    if program.is_none() {
+        ui.set_update_note("This copy runs from its own folder, so it updates with git.".into());
+    }
     let (w, f) = (ui.as_weak(), found.clone());
     ui.on_check_now(move || check_for_update(&w.unwrap(), f.clone(), true));
     let w = ui.as_weak();
     ui.on_update_later(move || w.unwrap().set_update_version("".into()));
-    let f = found.clone();
-    ui.on_update_notes(move || {
-        if let Some(release) = f.lock().unwrap().as_ref() {
-            vntl::setup::open_page(&release.page);
+    // the About tab's links, which only ever go to the project's own pages
+    ui.on_open_page(|page| {
+        if page.starts_with("https://github.com/vVKamiVv/Kidoku") {
+            vntl::setup::open_page(&page);
         }
     });
     let (w, f, installed) = (ui.as_weak(), found.clone(), program.clone());
@@ -891,6 +890,13 @@ fn run_quiet_install(folder: &str, files_only: bool) -> ! {
     std::process::exit(if done.is_ok() { 0 } else { 1 })
 }
 
+/// The version, and which commit and day the build came from, as `build.rs` found them.
+fn version_text() -> String {
+    let commit = env!("KIDOKU_COMMIT");
+    let from = if commit.is_empty() { String::new() } else { format!("  ·  build {commit}") };
+    format!("{}{from}  ·  {}", env!("CARGO_PKG_VERSION"), env!("KIDOKU_BUILT"))
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     #[cfg(windows)]
     {
@@ -912,6 +918,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     let ui = AppWindow::new()?;
     ui.set_calm(animations_off());
+    ui.set_version_text(version_text().into());
     ui.set_rows(ModelRc::new(VecModel::<LogRow>::default()));
     let w = ui.as_weak();
     ui.on_lines_switched(move |on| {

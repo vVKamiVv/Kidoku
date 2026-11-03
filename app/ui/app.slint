@@ -26,7 +26,7 @@ export struct UsageRow {
     state: int, // a Theme state, for the meter's colour
 }
 
-// One model on the Recommended tab.
+// One model on the Model Download page.
 export struct OfferRow {
     title: string,
     model: string,
@@ -643,7 +643,27 @@ component Switch {
     press := Press { act => { root.flip(); } }
 }
 
-// Four tabs share the panel, so the number sits over the name and a state is its mark alone.
+// A heading that can be picked, for the two pages of the right panel.
+component Heading {
+    in property <string> text; in property <bool> active;
+    callback clicked;
+    width: word.preferred-width + 16px; height: 24px; forward-focus: press;
+    accessible-role: tab; accessible-label: root.text;
+    accessible-item-selectable: true; accessible-item-selected: root.active;
+    accessible-action-default => { root.clicked(); }
+    Frame {
+        line: root.active ? Theme.edge : press.hover ? Theme.frame : transparent;
+        face: root.active ? Theme.raised : transparent;
+        lo: root.active ? Theme.pink : transparent;
+    }
+    word := Text {
+        x: 8px; height: root.height; text: root.text; font-family: Theme.mono; font-weight: 700;
+        color: root.active ? Theme.text : Theme.muted; vertical-alignment: center;
+    }
+    press := Press { act => { root.clicked(); } }
+}
+
+// Three tabs share the panel, so the number sits over the name and a state is its mark alone.
 component Tab {
     in property <string> number; in property <string> text;
     in property <string> tag; // a count
@@ -915,6 +935,8 @@ export component AppWindow inherits Window {
     in property <bool> can-update; // an installed copy, not a build run from its own folder
     in property <string> update-version; // a newer version on offer
     in property <string> update-note;
+    in property <string> news; // what's new since this copy, newest first
+    in property <string> version-text; // the version, its commit and the day it was built
     in property <bool> calm; // Windows has animations turned off
 
     callback game-edited();
@@ -939,10 +961,11 @@ export component AppWindow inherits Window {
     callback character-edited(int, string, string); // row, field, value
     callback update-now();
     callback update-later();
-    callback update-notes();
     callback check-now();
+    callback open-page(string);
 
     property <int> tab: 0;
+    property <int> side: 0; // the right panel: 0 the log, 1 model download, 2 about
     property <int> tick;
     property <int> party; // redraws left of the finish moment
     // These only colour the mood: if the Rust wording changes, nothing else breaks.
@@ -992,7 +1015,7 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1; vertical-alignment: center; color: Theme.text; overflow: elide; accessible-live-region: polite;
                         text: "Kidoku " + root.update-version + " is out." + (root.running ? " It can install once this run is done." : "");
                     }
-                    Button { text: "What's new"; clicked => { root.update-notes(); } }
+                    Button { text: "What's new"; clicked => { root.side = 2; } }
                     Button { text: "Later"; enabled: !root.fetching; clicked => { root.update-later(); } }
                     Button { text: "Update"; kind: 1; enabled: !root.running && !root.fetching; clicked => { root.update-now(); } }
                 }
@@ -1012,7 +1035,6 @@ export component AppWindow inherits Window {
                             Tab { number: ">>1"; text: "Game"; tag-state: engine-state; active: tab == 0; clicked => { tab = 0; } }
                             Tab { number: ">>2"; text: "Model"; tag-state: server-state; active: tab == 1; clicked => { tab = 1; } }
                             Tab { number: ">>3"; text: "Game Data"; tag: characters.length > 0 ? characters.length : ""; active: tab == 2; clicked => { tab = 2; } }
-                            Tab { number: ">>4"; text: "Recommended"; active: tab == 3; clicked => { tab = 3; } }
                         }
                         holder := Rectangle {
                             vertical-stretch: 1;
@@ -1073,18 +1095,18 @@ export component AppWindow inherits Window {
                                         Field { text: "Server"; Input { text <=> root.url; label: "Server"; edited => { root.refresh-models(); } } }
                                         Field {
                                             text: "Model";
-                                            Drop { items: root.models; current: root.model; label: "Model"; list-width: parent.width; empty-text: "No models yet, see Recommended"; picked(value) => { root.model = value; } }
+                                            Drop { items: root.models; current: root.model; label: "Model"; list-width: parent.width; empty-text: "No models yet, see Model Download"; picked(value) => { root.model = value; } }
                                             Button { text: "Refresh"; clicked => { root.refresh-models(); } }
                                         }
                                         Status { text: root.server-text; state: root.server-state; }
                                     }
                                     Post {
                                         title: "Image model  ·  menu images, names, menus";
-                                        Drop { items: root.models; current: root.vision-model; label: "Image model"; list-width: parent.width; empty-text: "No models yet, see Recommended"; picked(value) => { root.vision-model = value; } }
+                                        Drop { items: root.models; current: root.vision-model; label: "Image model"; list-width: parent.width; empty-text: "No models yet, see Model Download"; picked(value) => { root.vision-model = value; } }
                                     }
                                     Post {
                                         title: "Memory  ·  VN models only";
-                                        hint: "Earlier lines the model sees, growing to twice this before it forgets the oldest. More reads better. Works during a run, on new lines; Start over redoes a game.";
+                                        hint: "Earlier lines the model sees. More reads better, and it can change during a run.";
                                         Row {
                                             Steps { minimum: 6; maximum: 24; value <=> root.history; label: "Earlier lines the model sees"; }
                                             Quiet { text: root.history + " lines"; color: Theme.text; width: 56px; horizontal-alignment: right; }
@@ -1092,7 +1114,7 @@ export component AppWindow inherits Window {
                                     }
                                     Post {
                                         title: "Live usage";
-                                        hint: "A model's meter shows how much of it fits on the graphics card. The card's own line counts every program.";
+                                        hint: "Each meter shows how much of a model fits on the graphics card.";
                                         for row in root.usage: Meter { label: row.label; value: row.value; share: row.share; state: row.state; }
                                     }
                                 }
@@ -1109,7 +1131,7 @@ export component AppWindow inherits Window {
                                     x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
                                     Post {
                                         title: "VNDB  ·  optional";
-                                        hint: "Fills in the synopsis, characters and descriptions. Only the title goes to vndb.org, and whatever is here already stays.";
+                                        hint: "Fills in the synopsis, characters and descriptions. Only the title is sent, and what's here stays.";
                                         Input { text <=> root.vndb-query; label: "Title or VNDB id"; placeholder: "Game title, or a VNDB id like v17"; }
                                         HorizontalLayout {
                                             alignment: start;
@@ -1123,7 +1145,7 @@ export component AppWindow inherits Window {
                                     }
                                     Post {
                                         title: "Characters  ·  optional";
-                                        hint: "Name in the game's language, how to write it in English, and gender, so the model gets names and pronouns right. Saved in the game's vntl_work/characters.txt.";
+                                        hint: "So the model gets names and pronouns right.";
                                     }
                                     if root.characters.length > 0: HorizontalLayout {
                                         spacing: 6px; alignment: start; padding-left: 4px;
@@ -1193,14 +1215,37 @@ export component AppWindow inherits Window {
                                 }
                             }
 
-                            if tab == 3: picks-page := Scroller {
-                                x: 0px; width: holder.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Recommended";
+                        }
+                    }
+                }
+
+                // The thread: the status is its subject line, and the log is below it.
+                Frame {
+                    // An explicit minimum, or the sticker word's width would nudge this edge between states.
+                    min-width: 300px; preferred-width: 402px; horizontal-stretch: 3; line: Theme.frame; face: Theme.board;
+                    VerticalLayout {
+                        padding: 8px; spacing: 8px;
+                        HorizontalLayout {
+                            height: 24px; spacing: 6px; accessible-role: tab-list;
+                            Heading { text: "LOG"; active: root.side == 0; clicked => { root.side = 0; } }
+                            Heading { text: "MODEL DOWNLOAD"; active: root.side == 1; clicked => { root.side = 1; } }
+                            Heading { text: "ABOUT"; active: root.side == 2; clicked => { root.side = 2; } }
+                            Rectangle { horizontal-stretch: 1; }
+                            Sticker { text: root.mood-word; state: mood; icon: root.stopped && mood == 2 ? Theme.mark-stop : Theme.state-mark(mood); }
+                        }
+
+                        // The pages reach into the panel's padding, so their scrollbar has a lane of its own.
+                        pages := Rectangle {
+                            vertical-stretch: 1;
+
+                            if root.side == 1: Scroller {
+                                x: 0px; width: pages.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "Model Download";
                                 content-h: picks-form.preferred-height;
                                 picks-form := VerticalLayout {
-                                    x: 0px; y: 0px; width: holder.width; spacing: 8px; alignment: start;
+                                    x: 0px; y: 0px; width: pages.width; spacing: 8px; alignment: start;
                                     Post {
                                         title: "Text models  ·  translate the story";
-                                        hint: "All fine-tuned on visual novels. Get the largest your graphics card holds.";
+                                        hint: "Get the largest your graphics card holds.";
                                         for offer in root.text-offers: Offer {
                                             item: offer; chosen: offer.model == root.model; busy: root.fetching || root.running;
                                             get => { root.get-model(offer.model); }
@@ -1209,11 +1254,41 @@ export component AppWindow inherits Window {
                                     }
                                     Post {
                                         title: "Image models  ·  menus, names, genders";
-                                        hint: "The text reader reads labels. An image model does the rest, and these general ones can refuse adult text.";
+                                        hint: "General models can refuse adult text.";
                                         for offer in root.image-offers: Offer {
                                             item: offer; chosen: !offer.always && offer.model == root.vision-model; busy: root.fetching || root.running;
                                             get => { root.get-model(offer.model); }
                                             pick => { root.vision-model = offer.model; }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if root.side == 2: Scroller {
+                                x: 0px; width: pages.width + 8px; follow: true; accessible-role: tab-panel; accessible-label: "About";
+                                content-h: about-form.preferred-height;
+                                about-form := VerticalLayout {
+                                    x: 0px; y: 0px; width: pages.width; spacing: 8px; alignment: start;
+                                    Post {
+                                        title: "About Kidoku";
+                                        Field { text: "Version"; Text { text: root.version-text; font-family: Theme.mono; font-size: 13px; color: Theme.text; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; } }
+                                        Field { text: "Made by"; Text { text: "TruEKami"; font-weight: 700; color: Theme.pink; vertical-alignment: center; horizontal-stretch: 1; } }
+                                        Field { text: "License"; Text { text: "GPL-3.0"; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; } }
+                                        Field { text: "Thanks to"; Text { text: "lmg-anon's VNTL models, meikiocr, Ollama, Slint and VNDB"; color: Theme.text; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; } }
+                                        Row {
+                                            alignment: start;
+                                            Button { text: "GitHub"; clicked => { root.open-page("https://github.com/vVKamiVv/Kidoku"); } }
+                                            Button { text: "Guidebook"; clicked => { root.open-page("https://github.com/vVKamiVv/Kidoku/wiki"); } }
+                                            Button { text: "Report a problem"; clicked => { root.open-page("https://github.com/vVKamiVv/Kidoku/issues"); } }
+                                        }
+                                    }
+                                    Post {
+                                        title: root.update-version != "" ? "What's new  ·  Kidoku " + root.update-version : "What's new";
+                                        hint: root.news == "" ? "Nothing new yet." : "";
+                                        if root.news != "": Text { text: root.news; font-size: 13px; color: Theme.text; wrap: word-wrap; }
+                                        if root.update-version != "": Row {
+                                            alignment: start;
+                                            Button { text: "Update"; kind: 1; enabled: !root.running && !root.fetching; clicked => { root.update-now(); } }
                                         }
                                     }
                                     Post {
@@ -1227,98 +1302,92 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
 
-                // The thread: the status is its subject line, and the log is below it.
-                Frame {
-                    // An explicit minimum, or the sticker word's width would nudge this edge between states.
-                    min-width: 300px; preferred-width: 402px; horizontal-stretch: 3; line: Theme.frame; face: Theme.board;
-                    VerticalLayout {
-                        padding: 8px; spacing: 8px;
-                        HorizontalLayout {
-                            height: 24px; spacing: 6px;
-                            Text { text: "TRANSLATION LOG"; font-family: Theme.mono; font-weight: 700; color: Theme.muted; vertical-alignment: center; }
-                            Sticker { text: root.mood-word; state: mood; icon: root.stopped && mood == 2 ? Theme.mark-stop : Theme.state-mark(mood); }
-                            Rectangle { horizontal-stretch: 1; }
-                            Switch { text: "SHOW LINES"; on <=> root.show-lines; }
-                            HitCounter { value: root.last-number; accessible-role: text; accessible-label: "Posts in the thread"; accessible-value: root.last-number; }
-                        }
-                        Frame {
-                            line: Theme.frame; face: Theme.raised;
-                            VerticalLayout {
-                                padding-left: 12px; padding-right: 12px; padding-top: 6px; padding-bottom: 6px;
-                                Text {
-                                    text: root.status-text; font-weight: 700; wrap: word-wrap; accessible-live-region: polite;
-                                    color: mood == 3 ? Theme.bad : mood == 2 ? Theme.moon : mood == 1 ? Theme.ok : Theme.text;
-                                }
-                            }
-                        }
-
-                        Frame {
-                            vertical-stretch: 1; line: Theme.edge; face: Theme.well;
+                            // The log stays built while hidden: its scroll position drives what's drawn.
                             Rectangle {
-                                x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; clip: true;
-                                for i in root.shown-posts: Rectangle {
-                                    property <int> index: root.first-post + i;
-                                    property <LogRow> entry: root.rows[index];
-                                    property <bool> live: root.running || root.run-failed;
-                                    property <bool> newest: index == root.posts - 1;
-                                    y: index * root.line-h + log-view.offset-y + 6px;
-                                    height: root.line-h;
-                                    background: live && entry.number == root.last-number ? Theme.raised : entry.number.mod(2) == 1 ? Theme.stripe : transparent;
-                                    Quiet { x: 6px; width: 58px; height: 100%; text: parent.entry.time; font-family: Theme.mono; font-size: 12px; }
-                                    Quiet {
-                                        x: 58px; width: 54px; height: 100%; horizontal-alignment: right;
-                                        text: parent.entry.time == "" || (parent.newest && parent.live) ? "" : ">>" + parent.entry.number;
-                                        font-family: Theme.mono; font-size: 12px; color: parent.newest ? Theme.pink : Theme.blue;
-                                    }
-                                }
-                                TouchArea { x: 0px; width: root.gutter; scroll-event(e) => { log-view.scroll-by(e.delta-y); accept } }
-                                log-view := Scroller {
-                                    x: root.gutter; width: parent.width - root.gutter; accessible-role: list; accessible-label: "Translation log";
-                                    content-w: root.widest * 7.2px + 14px; content-h: root.posts * root.line-h + 12px;
-                                    for i in root.shown-posts: Text {
-                                        property <LogRow> entry: root.rows[root.first-post + i];
-                                        x: 0px; y: (root.first-post + i) * root.line-h + 6px; width: self.preferred-width; height: root.line-h;
-                                        text: self.entry.text; font-family: Theme.mono; font-size: 13px; vertical-alignment: center;
-                                        color: self.entry.kind == 1 ? Theme.muted : Theme.text;
-                                    }
-                                }
-                                // Lives in the gutter, in place of the post number, so it can never cover log text.
-                                if (root.running || root.run-failed) && root.posts > 0 && (root.posts - 1) * root.line-h + log-view.offset-y < log-view.view-h: Sticker {
-                                    x: 64px;
-                                    y: min(parent.height - 28px, (root.posts - 1) * root.line-h + log-view.offset-y + 6px + (root.line-h - self.height) / 2);
-                                    height: 20px; text: "NEW!"; icon: ""; state: root.running ? 4 : 3;
-                                }
-                                // An empty thread keeps a sticky: the first thing a new user needs to know.
-                                if root.posts == 0: Frame {
-                                    x: 12px; y: 12px; width: min(parent.width - 24px, 620px); height: sticky.preferred-height;
-                                    line: Theme.frame; face: Theme.stripe;
-                                    sticky := VerticalLayout {
-                                        padding: 12px; spacing: 6px;
+                                visible: root.side == 0;
+                                VerticalLayout {
+                                    spacing: 8px;
+                                    Frame {
+                                        line: Theme.frame; face: Theme.raised;
                                         HorizontalLayout {
-                                            spacing: 8px; alignment: start; height: 20px;
-                                            Sticker { text: "STICKY"; state: 2; }
-                                            Quiet { text: "Anonymous Cat"; font-weight: 700; color: Theme.ok; }
-                                            Cat { width: 20px; height: 18px; pose: 4; }
-                                        }
-                                        Text { text: "How this thread works"; font-weight: 700; color: Theme.pale; }
-                                        for step[i] in ["Pick the game folder and check its engine is OK.", "Pick a model from your model server.", "Import the game's data, or list its characters.", "No model yet? Get one here."]: HorizontalLayout {
-                                            spacing: 8px;
-                                            // Quote links jump to their post, as on any board. Keyboard users have the tabs.
+                                            padding-left: 12px; padding-right: 8px; padding-top: 6px; padding-bottom: 6px; spacing: 6px;
                                             Text {
-                                                text: ">>" + (i + 1); width: 24px; font-family: Theme.mono; color: Theme.blue; accessible-role: none; vertical-alignment: center;
-                                                TouchArea { mouse-cursor: pointer; clicked => { tab = i; } }
+                                                horizontal-stretch: 1; vertical-alignment: center;
+                                                text: root.status-text; font-weight: 700; wrap: word-wrap; accessible-live-region: polite;
+                                                color: mood == 3 ? Theme.bad : mood == 2 ? Theme.moon : mood == 1 ? Theme.ok : Theme.text;
                                             }
-                                            Text { text: step; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                            VerticalLayout { alignment: center; Switch { text: "SHOW LINES"; on <=> root.show-lines; } }
+                                            VerticalLayout { alignment: center; HitCounter { value: root.last-number; accessible-role: text; accessible-label: "Posts in the thread"; accessible-value: root.last-number; } }
                                         }
-                                        Text { text: "Then press Translate. Each finished line lands here as a post, and the moon fills with progress."; color: Theme.text; wrap: word-wrap; }
-                                        HorizontalLayout {
-                                            spacing: 12px; alignment: start;
-                                            Image { width: 88px; height: 31px; source: @image-url("badge.png"); image-rendering: pixelated; accessible-label: "Kidoku, local model"; }
-                                            Quiet { text: "best viewed at night with a warm GPU (^_^)"; font-size: 12px; font-italic: true; }
+                                    }
+
+                                    Frame {
+                                        vertical-stretch: 1; line: Theme.edge; face: Theme.well;
+                                        Rectangle {
+                                            x: 2px; y: 2px; width: parent.width - 4px; height: parent.height - 4px; clip: true;
+                                            for i in root.shown-posts: Rectangle {
+                                                property <int> index: root.first-post + i;
+                                                property <LogRow> entry: root.rows[index];
+                                                property <bool> live: root.running || root.run-failed;
+                                                property <bool> newest: index == root.posts - 1;
+                                                y: index * root.line-h + log-view.offset-y + 6px;
+                                                height: root.line-h;
+                                                background: live && entry.number == root.last-number ? Theme.raised : entry.number.mod(2) == 1 ? Theme.stripe : transparent;
+                                                Quiet { x: 6px; width: 58px; height: 100%; text: parent.entry.time; font-family: Theme.mono; font-size: 12px; }
+                                                Quiet {
+                                                    x: 58px; width: 54px; height: 100%; horizontal-alignment: right;
+                                                    text: parent.entry.time == "" || (parent.newest && parent.live) ? "" : ">>" + parent.entry.number;
+                                                    font-family: Theme.mono; font-size: 12px; color: parent.newest ? Theme.pink : Theme.blue;
+                                                }
+                                            }
+                                            TouchArea { x: 0px; width: root.gutter; scroll-event(e) => { log-view.scroll-by(e.delta-y); accept } }
+                                            log-view := Scroller {
+                                                x: root.gutter; width: parent.width - root.gutter; accessible-role: list; accessible-label: "Translation log";
+                                                content-w: root.widest * 7.2px + 14px; content-h: root.posts * root.line-h + 12px;
+                                                for i in root.shown-posts: Text {
+                                                    property <LogRow> entry: root.rows[root.first-post + i];
+                                                    x: 0px; y: (root.first-post + i) * root.line-h + 6px; width: self.preferred-width; height: root.line-h;
+                                                    text: self.entry.text; font-family: Theme.mono; font-size: 13px; vertical-alignment: center;
+                                                    color: self.entry.kind == 1 ? Theme.muted : Theme.text;
+                                                }
+                                            }
+                                            // Lives in the gutter, in place of the post number, so it can never cover log text.
+                                            if (root.running || root.run-failed) && root.posts > 0 && (root.posts - 1) * root.line-h + log-view.offset-y < log-view.view-h: Sticker {
+                                                x: 64px;
+                                                y: min(parent.height - 28px, (root.posts - 1) * root.line-h + log-view.offset-y + 6px + (root.line-h - self.height) / 2);
+                                                height: 20px; text: "NEW!"; icon: ""; state: root.running ? 4 : 3;
+                                            }
+                                            // An empty thread keeps a sticky: the first thing a new user needs to know.
+                                            if root.posts == 0: Frame {
+                                                x: 12px; y: 12px; width: min(parent.width - 24px, 620px); height: sticky.preferred-height;
+                                                line: Theme.frame; face: Theme.stripe;
+                                                sticky := VerticalLayout {
+                                                    padding: 12px; spacing: 6px;
+                                                    HorizontalLayout {
+                                                        spacing: 8px; alignment: start; height: 20px;
+                                                        Sticker { text: "STICKY"; state: 2; }
+                                                        Quiet { text: "Anonymous Cat"; font-weight: 700; color: Theme.ok; }
+                                                        Cat { width: 20px; height: 18px; pose: 4; }
+                                                    }
+                                                    Text { text: "How this thread works"; font-weight: 700; color: Theme.pale; }
+                                                    for step[i] in ["Pick the game folder and check its engine is OK.", "Pick a model from your model server.", "Import the game's data, or list its characters.", "No model yet? Get one here."]: HorizontalLayout {
+                                                        spacing: 8px;
+                                                        // Quote links jump to their post, as on any board. Keyboard users have the tabs.
+                                                        Text {
+                                                            text: ">>" + (i + 1); width: 24px; font-family: Theme.mono; color: Theme.blue; accessible-role: none; vertical-alignment: center;
+                                                            TouchArea { mouse-cursor: pointer; clicked => { if i < 3 { tab = i; } else { side = 1; } } }
+                                                        }
+                                                        Text { text: step; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                                    }
+                                                    Text { text: "Then press Translate. Each finished line lands here as a post, and the moon fills with progress."; color: Theme.text; wrap: word-wrap; }
+                                                    HorizontalLayout {
+                                                        spacing: 12px; alignment: start;
+                                                        Image { width: 88px; height: 31px; source: @image-url("badge.png"); image-rendering: pixelated; accessible-label: "Kidoku, local model"; }
+                                                        Quiet { text: "best viewed at night with a warm GPU (^_^)"; font-size: 12px; font-italic: true; }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

@@ -9,7 +9,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const LATEST: &str = "https://api.github.com/repos/vVKamiVv/Kidoku/releases/latest";
+/// The newest releases, enough to cover any copy still in use.
+const LIST: &str = "https://api.github.com/repos/vVKamiVv/Kidoku/releases?per_page=30";
+/// Where a release's notes stop saying what's new: the install help every release repeats.
+const HELP: [&str; 4] = ["**Update:**", "**New here?**", "**Install:**", "|"];
 /// Where a release's page and files have to be: a reply can't send us anywhere else.
 const RELEASES: &str = "https://github.com/vVKamiVv/Kidoku/releases/";
 const ASSET: &str = "Kidoku-Setup.exe";
@@ -22,9 +25,23 @@ const TRIES: usize = 60;
 pub struct Release {
     pub version: String,
     pub page: String,
+    /// What's new in it, and in every release since this copy's, newest first, as plain text.
+    pub notes: String,
     url: String,
     size: u64,
     sum: String,
+}
+
+/// What a release's notes say is new, without the install help or Markdown's marks.
+fn plain(body: &str) -> String {
+    let link = regex::Regex::new(r"\[([^\]]*)\]\([^)]*\)").unwrap();
+    let said: Vec<String> = body.replace("\r\n", "\n").split("\n\n").map(str::trim)
+        .take_while(|p| !HELP.iter().any(|h| p.starts_with(h)))
+        .filter(|p| !p.is_empty())
+        .map(|p| link.replace_all(p, "$1").replace("**", "").replace('`', "").replace("\n- ", "\n•  "))
+        .map(|p| p.strip_prefix("- ").map_or(p.clone(), |rest| format!("•  {rest}")))
+        .collect();
+    said.join("\n\n")
 }
 
 fn numbers(version: &str) -> Option<Vec<u32>> {
@@ -36,23 +53,39 @@ fn newer(version: &str, current: &str) -> bool {
     matches!((numbers(version), numbers(current)), (Some(a), Some(b)) if a > b)
 }
 
-/// A release as GitHub describes it. None without a Setup, a sum, or an address of ours.
-pub fn read(text: &str) -> Option<Release> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+/// A release as GitHub describes it. None without a Setup, a sum, or an address of ours, and for a
+/// draft or a test release.
+fn read(v: &serde_json::Value) -> Option<Release> {
+    if v["draft"] == true || v["prerelease"] == true {
+        return None;
+    }
     let asset = v["assets"].as_array()?.iter().find(|a| a["name"] == ASSET)?;
     let page = v["html_url"].as_str().filter(|p| p.starts_with(RELEASES))?.to_string();
     let url = asset["browser_download_url"].as_str().filter(|u| u.starts_with(RELEASES))?.to_string();
     let sum = asset["digest"].as_str()?.strip_prefix("sha256:")?.to_lowercase();
-    Some(Release { version: v["tag_name"].as_str()?.trim_start_matches('v').to_string(), page, url, size: asset["size"].as_u64()?, sum })
+    let version = v["tag_name"].as_str()?.trim_start_matches('v').to_string();
+    Some(Release { version, page, notes: plain(v["body"].as_str().unwrap_or_default()), url, size: asset["size"].as_u64()?, sum })
+}
+
+/// The newest of GitHub's list of releases, if it's newer than `current`, with the notes of all the
+/// releases since `current`.
+pub fn newest(list: &str, current: &str) -> Option<Release> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(list).ok()?;
+    let mut since: Vec<Release> = list.iter().filter_map(read).filter(|r| newer(&r.version, current)).collect();
+    since.sort_by_key(|r| std::cmp::Reverse(numbers(&r.version)));
+    let notes = since.iter().map(|r| format!("Kidoku {}\n\n{}", r.version, r.notes)).collect::<Vec<_>>().join("\n\n\n");
+    since.into_iter().next().map(|r| Release { notes, ..r })
 }
 
 /// A release newer than this copy, if there is one.
 pub fn check() -> R<Option<Release>> {
     let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(20))).build().into();
-    let request = agent.get(LATEST).header("User-Agent", format!("Kidoku/{CURRENT}")).header("Accept", "application/vnd.github+json");
+    let request = agent.get(LIST).header("User-Agent", format!("Kidoku/{CURRENT}")).header("Accept", "application/vnd.github+json");
     let text = request.call().map_err(|e| e.to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    let release = read(&text).ok_or("GitHub's answer has no Setup in it")?;
-    Ok(newer(&release.version, CURRENT).then_some(release))
+    if !text.trim_start().starts_with('[') {
+        return Err("GitHub's answer isn't a list of releases".into());
+    }
+    Ok(newest(&text, CURRENT))
 }
 
 /// The program, when this copy is an installed one. A build run from its own folder has git instead.
@@ -157,12 +190,43 @@ mod tests {
 
     const DOWNLOAD: &str = "https://github.com/vVKamiVv/Kidoku/releases/download/v9.0.0/Kidoku-Setup.exe";
 
-    fn reply(url: &str, digest: &str) -> String {
+    fn reply(url: &str, digest: &str) -> serde_json::Value {
         serde_json::json!({
             "tag_name": "v9.0.0", "html_url": "https://github.com/vVKamiVv/Kidoku/releases/tag/v9.0.0",
             "assets": [{"name": "vntl.exe", "browser_download_url": "x", "size": 1, "digest": "sha256:00"},
                        {"name": ASSET, "browser_download_url": url, "size": 12, "digest": digest}],
-        }).to_string()
+        })
+    }
+
+    fn version(tag: &str, body: &str, test: bool) -> serde_json::Value {
+        let mut v = reply(DOWNLOAD, "sha256:ab");
+        v["tag_name"] = tag.into();
+        v["body"] = body.into();
+        v["prerelease"] = test.into();
+        v
+    }
+
+    #[test]
+    fn notes_say_what_is_new_without_the_install_help() {
+        let body = "A fix for **one engine**, see the [guidebook](https://example.com).\r\n\r\n- **Faster:** it is.\n- Smaller `files`.\r\n\r\n\
+                    **Update:** Kidoku will offer this.\n\n**New here?** Run it.\n\n| File | What |\n|---|---|";
+        assert_eq!(plain(body), "A fix for one engine, see the guidebook.\n\n•  Faster: it is.\n•  Smaller files.");
+        assert_eq!(plain("Only news."), "Only news.");
+    }
+
+    #[test]
+    fn every_release_since_this_copy_is_told_newest_first() {
+        let list = serde_json::json!([
+            version("v0.1.6", "Six.\n\n**Update:** help", false),
+            version("v0.1.7", "Seven, a test.", true),
+            version("v0.1.5", "Five.", false),
+            version("v0.1.4", "Four, already here.", false),
+        ]).to_string();
+        let got = newest(&list, "0.1.4").unwrap();
+        assert_eq!(got.version, "0.1.6", "a test release isn't offered");
+        assert_eq!(got.notes, "Kidoku 0.1.6\n\nSix.\n\n\nKidoku 0.1.5\n\nFive.");
+        assert!(newest(&list, "0.1.6").is_none());
+        assert!(newest("not json", "0.1.4").is_none());
     }
 
     #[test]
@@ -178,8 +242,7 @@ mod tests {
         assert_eq!((got.version.as_str(), got.url.as_str(), got.size, got.sum.as_str()), ("9.0.0", DOWNLOAD, 12, "abcd"));
         assert!(read(&reply("https://example.com/Kidoku-Setup.exe", "sha256:ab")).is_none(), "somewhere else");
         assert!(read(&reply(DOWNLOAD, "md5:ab")).is_none(), "no sum to check against");
-        assert!(read("{\"tag_name\": \"v9.0.0\", \"assets\": []}").is_none());
-        assert!(read("not json").is_none());
+        assert!(read(&serde_json::json!({"tag_name": "v9.0.0", "assets": []})).is_none());
     }
 
     #[test]
@@ -192,7 +255,7 @@ mod tests {
     }
 
     fn release(url: String, data: &[u8], sum: String) -> Release {
-        Release { version: "9.0.0".into(), page: String::new(), url, size: data.len() as u64, sum: if sum.is_empty() { sha256(data) } else { sum } }
+        Release { version: "9.0.0".into(), page: String::new(), notes: String::new(), url, size: data.len() as u64, sum: if sum.is_empty() { sha256(data) } else { sum } }
     }
 
     #[test]

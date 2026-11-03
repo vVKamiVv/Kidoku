@@ -36,18 +36,18 @@
 ## `>>1` What it does
 
 - **Finds the engine by itself.** Pick a folder and the app tells you what the game runs on.
-- **Stays on your PC.** Text goes to your own Ollama server, and nowhere else unless you change the address. The one exception is **Import VN data from VNDB**, which you press yourself and which sends only the game's title. At start, an installed copy also asks GitHub what the newest version is, which sends nothing of yours, and you can turn that off.
+- **Stays on your PC.** Text only goes to your own Ollama server. A VNDB import sends just the game's title.
 - **Starts from what's known.** Import a synopsis, characters and descriptions from [VNDB](https://vndb.org), all editable on the Game Data tab.
 - **Picks up where it stopped.** Press **Stop** whenever you like, then **Translate** to carry on.
 - **Keeps your game safe.** Every file it changes is backed up first, and **Remove translation** puts the originals back.
 - **Gets names right.** Give it a list of characters and genders, and the model gets their names and pronouns.
-- **Works out genders.** With an image model picked, it reads each character's lines, looks at their sprite where a Ren'Py game makes that possible, and fills in any gender you left blank.
+- **Works out genders.** With an image model picked, it fills in any gender you left blank.
 - **Fits text to the box.** Show it a screenshot of a long line and it measures the game's message box, then rewraps everything to match.
-- **Repaints menu images.** It reads the text in buttons and menus, translates it, and paints the English in. Reading runs on the CPU, with a small model made for game text.
+- **Repaints menu images.** It reads the text in buttons and menus, and paints the English in.
 - **Uses what already exists.** On Ren'Py, lines from an official translation are copied instead of translated again.
-- **Shows its work.** Watch the Japanese and English arrive during a run, or switch **SHOW LINES** off to hide them.
-- **Shows what it's using.** The Model tab lists the app's and each model's VRAM, RAM and CPU, live.
-- **Recommends models.** The Recommended tab lists text and image models from 4 GB to 24 GB of graphics memory, a click to download.
+- **Shows its work.** Watch the Japanese and English arrive, or switch **SHOW LINES** off.
+- **Shows what it's using.** The Model tab shows VRAM, RAM and CPU use, live.
+- **Downloads models.** **Model Download** lists text and image models for 4 GB to 24 GB of graphics memory.
 
 <p align="center">
   <img src="docs/showcase-ja.webp" alt="A scene as the game ships it, in Japanese" width="49%">
@@ -82,11 +82,7 @@
 | **TyranoScript** | Scenes, names, buttons and the engine's own prompts, in a folder, `app.asar` or the exe | Not yet | Other text in the game's `.js` and HTML stays Japanese |
 | **NScripter** | Messages, choices and menus | Not yet | Old saves won't line up with the new script |
 
-Everything from Malie down is new: checked on real games' files, but not played through yet.
-
-The window only shows the options your game's engine can use.
-
-The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do) lists what each engine can do.
+From Malie down, engines are checked on real games' files, and most haven't been played through yet. The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do) has more on each.
 
 ## `>>3` Getting started
 
@@ -112,20 +108,20 @@ Then open **Kidoku.bat**. `release.bat` in the same folder builds the release fi
 
 **Update it**
 
-When a new version is out, Kidoku says so at the top of its window. Press **Update** and it installs the new version and reopens. Your settings, models and translations stay.
+When a new version is out, Kidoku offers it at the top of its window. **What's new** shows what changed, and **Update** installs it.
 
 **Run it**
 
 1. Start Ollama, then open **Kidoku**.
-2. On the **Recommended** tab, press **Get** on the biggest text model your GPU holds. **VNTL Llama 8B** suits 8 GB.
+2. Under **Model Download**, press **Get** on the biggest text model your GPU holds. **VNTL Llama 8B** suits 8 GB.
 3. On the **Game** tab, pick the game's folder.
 4. Press **Translate**, and start the game when it says Done.
 
-For menu images, genders and fitting text, also get the **Text reader** and an image model from the same tab.
+For menu images, genders and fitting text, also get the **Text reader** and an image model there.
 
 On a GPU with 8 GB of memory, the text and image models run one after the other.
 
-The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki) covers every tab and option, fixing text that doesn't fit, and what to do when something goes wrong.
+The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki) covers every option, and what to do when something goes wrong.
 
 <p align="center">
   <img src="docs/tabs.png" alt="The Model and Game Data tabs" width="100%">
@@ -133,7 +129,7 @@ The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki) covers every tab and op
 
 ## `>>4` Memory and speed
 
-Memory is how many earlier lines the model sees, growing to twice that before the oldest are forgotten in one go. More memory reads better and runs a little slower. The slider goes from 6 to 24 lines, and you can move it during a run.
+Memory is how many earlier lines the model sees. More reads better and runs a little slower. The slider goes from 6 to 24, and works during a run.
 
 | Memory | Lines per minute |
 |---|---|
@@ -145,7 +141,7 @@ Memory is how many earlier lines the model sees, growing to twice that before th
 
 ## `>>5` Command line
 
-Everything the window does also works from a terminal, using `vntl.exe` from `app/target/release`.
+Everything the window does also works from a terminal, with `vntl.exe`.
 
 ```bash
 vntl detect <game>
@@ -193,7 +189,7 @@ vntl write <game>
 | `vntl_work/box.txt` | The measured message box, in letters and rows, if you used **Fit text to the box** |
 | `*.vntl-orig` next to a changed file | The original, untouched |
 
-**Remove translation** puts the originals back and keeps your progress, so translating again is quick. If a game update changed a file, the new file stays and the older original is kept as `*.vntl-orig.old-N`.
+**Remove translation** puts the originals back and keeps your progress. If a game update changed a file, the new file stays.
 
 This repo holds no game files. Please use the app on games you own.
 

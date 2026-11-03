@@ -1,9 +1,17 @@
-use std::{env, fs, path::Path};
+use std::{env, fs, path::Path, process::Command, time::SystemTime};
 
 fn main() {
     // fluent-dark: the Windows 11 look, dark.
     let config = slint_build::CompilerConfiguration::new().with_style("fluent-dark".into());
     slint_build::compile_with_config("ui/app.slint", config).unwrap();
+
+    // what the About post shows: the commit built from, and the day, in UTC
+    let commit = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output().ok().filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    println!("cargo:rustc-env=KIDOKU_COMMIT={commit}");
+    let days = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64;
+    println!("cargo:rustc-env=KIDOKU_BUILT={}", date(days));
+    println!("cargo:rerun-if-changed=../.git/logs/HEAD"); // a new commit
 
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         let res = Path::new(&env::var("OUT_DIR").unwrap()).join("icon.res");
@@ -11,6 +19,18 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=vntl-gui={}", res.display());
         println!("cargo:rerun-if-changed=ui/app-icon.ico");
     }
+}
+
+/// Days since 1970 as a calendar date (Howard Hinnant's method).
+fn date(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (day, month) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    format!("{}-{month:02}-{day:02}", yoe + era * 400 + i64::from(month <= 2))
 }
 
 /// One entry of a compiled resource file: a header of numbered type and name, then the data on a 4-byte boundary.
