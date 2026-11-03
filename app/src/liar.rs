@@ -186,6 +186,18 @@ pub fn wrap(text: &str) -> String {
     lines.join("\n")
 }
 
+/// Rows the text box shows at once. A message with more stops the engine with a text format error.
+pub const ROWS: usize = 4;
+
+/// How many rows `text` takes once written.
+pub fn rows(text: &str) -> usize {
+    wrap(&ascii_punctuation(text)).lines().count()
+}
+
+pub fn fits(text: &str) -> bool {
+    rows(text) <= ROWS
+}
+
 /// The model's English back into a script string: line breaks as ^n, Shift-JIS bytes. Punctuation
 /// and symbols become ASCII: the engine only recognises two-byte characters on a Japanese-locale
 /// Windows, so `…` would come out as garbage elsewhere. Accented letters lose their accents, and
@@ -575,6 +587,14 @@ mod tests {
         assert_eq!(encode("", "Well… ♪"), b"Well... ~");
         assert_eq!(encode("^g012^n", "……！？"), b"^g012^n...!?");
         assert_eq!(encode("", "ＬＯＡＤ　ａ１"), b"LOAD a1");
+    }
+
+    #[test]
+    fn a_message_fits_in_four_rows_of_the_box() {
+        assert_eq!(rows("Short."), 1);
+        assert!(fits(&"word ".repeat(30)));
+        assert!(!fits(&"word ".repeat(40)), "two hundred letters run to a fifth row");
+        assert_eq!(rows("one\ntwo\nthree\nfour\nfive"), 5);
     }
 
     #[test]

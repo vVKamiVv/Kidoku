@@ -928,6 +928,8 @@ fn write_liar(game: &Path, cache: &Cache) -> R<String> {
     let n = liar::install(game, &|script, i, shipped| {
         let (prefix, body) = liar::split(shipped);
         match cache.lines.get(&format!("{script}#{i}")) {
+            // more rows than the box shows stops the game: that message keeps its Japanese
+            Some(tr) if !liar::fits(tr) => None,
             Some(tr) => Some(liar::encode(prefix, tr)),
             // only symbols or full-width letters: nothing to translate, but they have to be ASCII too
             None if !JA.is_match(shipped) && !shipped.is_ascii() => Some(liar::encode(prefix, &body)),
@@ -946,7 +948,42 @@ fn write_liar(game: &Path, cache: &Cache) -> R<String> {
         0 => String::new(),
         drawn => format!(" {drawn} name plates drawn in English."),
     };
-    Ok(format!("Wrote {n} translated strings into scr.xfl (read back OK; originals kept as *.vntl-orig); {exe}.{lossy}{plates}"))
+    let long = match cache.lines.values().filter(|t| !liar::fits(t)).count() {
+        0 => String::new(),
+        long => format!(" {long} messages are too long for the text box and stay in Japanese until they're shortened."),
+    };
+    Ok(format!("Wrote {n} translated strings into scr.xfl (read back OK; originals kept as *.vntl-orig); {exe}.{lossy}{plates}{long}"))
+}
+
+/// Messages the English made longer than the text box holds, which the engine stops on. A model that
+/// takes instructions shortens them, two tries each per run; what still runs over stays Japanese.
+fn shorten_liar(model: &dyn Chat, lines: &[Line], cache: &mut Cache, log: &dyn Fn(String), cancel: &AtomicBool) -> R<()> {
+    let long: Vec<(&String, &String)> = lines.iter().filter(|(k, _, _)| cache.lines.get(k).is_some_and(|en| !liar::fits(en))).map(|(k, _, jp)| (k, jp)).collect();
+    if long.is_empty() {
+        return Ok(());
+    }
+    log(format!("Shortening {} messages that run past the text box", long.len()));
+    let mut fixed = 0;
+    for (key, jp) in long {
+        let en = cache.lines[key].clone();
+        for share in [9, 7] {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped".into());
+            }
+            let most = en.chars().count() * liar::ROWS * share / (liar::rows(&en) * 10);
+            let reply = model.chat(SYSTEM, &format!(
+                "This line from a Japanese visual novel is too long for its text box: \"{en}\" (Japanese: {jp}). Rewrite it in \
+                 natural English in at most {most} characters, keeping what it says, its tone and any names. Reply with the line only."))?;
+            let short = reply.trim().trim_matches('"').to_string();
+            if same_markup(&liar::MARKUP, jp, &short) && liar::fits(&short) {
+                cache.lines.insert(key.clone(), short);
+                fixed += 1;
+                break;
+            }
+        }
+    }
+    log(format!("  {fixed} shortened"));
+    Ok(())
 }
 
 fn plates_path(game: &Path) -> PathBuf {
@@ -989,11 +1026,20 @@ fn liar_lines(texts: Vec<(String, usize, String)>, names: &HashMap<String, Strin
 fn translate_liar(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<()> {
     let log = |s: String| report(Event::Log(s));
     let lines = liar_lines(liar::texts(&o.game)?, &plate_names(o, &log)?);
-    translate_script(o, chat, report, cancel, "Liar-soft", &lines, &liar::MARKUP, &|cache| {
-        let long = cache.lines.values().filter(|t| liar::wrap(t).lines().count() > 4).count();
-        let warning = if long > 0 { format!("\n  {long} messages run past 4 lines and may not fit the text box") } else { String::new() };
-        Ok(write_liar(&o.game, cache)? + &warning)
-    })?;
+    translate_script(o, chat, report, cancel, "Liar-soft", &lines, &liar::MARKUP, &|cache| write_liar(&o.game, cache))?;
+    let path = cache_file(&o.game, &o.lang);
+    let mut cache: Cache = load_json(&path)?;
+    if cache.lines.values().any(|t| !liar::fits(t)) {
+        let words = instruction_model(o, chat);
+        if is_vntl(words.model()) {
+            log("Long messages can be shortened by a model that takes instructions: pick an image model, then Translate again.".into());
+        } else {
+            let run = shorten_liar(words, &lines, &mut cache, &log, cancel);
+            save_json(&path, &cache)?;
+            run?;
+            log(write_liar(&o.game, &cache)?);
+        }
+    }
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
         log(crate::menus::translate_menus(&o.game, vision.as_ref(), report, cancel)?);
         // menus are rebuilt from the game's own archive, which has the Japanese plates
@@ -1528,6 +1574,23 @@ mod tests {
         assert_eq!(english_name(&HashMap::new(), &cache, "太郎").as_deref(), Some("Taro"));
         let listed = HashMap::from([("太郎".to_string(), "Tarou".to_string())]);
         assert_eq!(english_name(&listed, &cache, "太郎").as_deref(), Some("Tarou"));
+    }
+
+    #[test]
+    fn a_liar_soft_message_too_long_for_the_box_is_shortened_or_kept_out() {
+        const LONG: &str = "This is a sentence that goes on and on, far past the four rows the box can show at once, \
+                            and then keeps going with more words, and more, until the engine would stop on it, \
+                            which is exactly what this test is about, so it keeps going a little longer still.";
+        let lines: Vec<Line> = ["a#1", "a#2", "a#3"].map(|k| (k.to_string(), None, "長い話".to_string())).into();
+        let mut cache = Cache::default();
+        for (k, en) in [("a#1", LONG), ("a#2", LONG), ("a#3", "Short.")] {
+            cache.lines.insert(k.into(), en.into());
+        }
+        let model = Scripted::new(&["A shorter line.", LONG, LONG]);
+        shorten_liar(&model, &lines, &mut cache, &|_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(cache.lines["a#1"], "A shorter line.");
+        assert_eq!(cache.lines["a#2"], LONG, "two tries, then it stays as it was, and the write leaves it Japanese");
+        assert_eq!(cache.lines["a#3"], "Short.", "what fits isn't asked about");
     }
 
     #[test]
