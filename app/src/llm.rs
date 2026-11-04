@@ -238,6 +238,8 @@ pub struct Offer {
 pub const TEXT_READER: &str = "meikiocr";
 /// The same for the fonts repainted images can use.
 pub const FONT_PACK: &str = "fontpack";
+/// The same for the model that fills in behind repainted text.
+pub const INPAINTER: &str = "lama";
 
 /// Models that translate, smallest first. All VNTL, because general models can refuse adult text.
 pub const TEXT_OFFERS: [Offer; 5] = [
@@ -248,23 +250,59 @@ pub const TEXT_OFFERS: [Offer; 5] = [
     Offer { title: "VNTL Gemma 27B, finer", model: "hf.co/lmg-anon/vntl-gemma2-27b-gguf:Q5_K_M", size: "19.4 GB", gpu: "GPU 24 GB", note: "The strongest here: the same model, less compressed." },
 ];
 
+/// The image model tested most, which writes menus' English.
+pub const IMAGE_MODEL: &str = "gemma3:12b";
+/// The model tested best at reading Japanese in menu pictures, though its English is weaker.
+pub const READING_MODEL: &str = "qwen2.5vl:7b";
+
 /// Models that look at images, smallest first, starting with the text reader.
-pub const IMAGE_OFFERS: [Offer; 6] = [
+pub const IMAGE_OFFERS: [Offer; 8] = [
     Offer { title: "Text reader (meikiocr)", model: TEXT_READER, size: "33 MB", gpu: "CPU", note: "Reads Japanese in menus and screenshots, for any GPU. Get this first." },
     Offer { title: "Font pack (20 free fonts)", model: FONT_PACK, size: "110 MB", gpu: "CPU", note: "More looks for repainted images, brush lettering too. The first match takes longer." },
-    Offer { title: "Gemma 3 12B", model: "gemma3:12b", size: "8.2 GB", gpu: "GPU 12 GB", note: "The one tested most with this app. Slower on 8 GB." },
+    Offer { title: "Inpainting (LaMa)", model: INPAINTER, size: "208 MB", gpu: "CPU", note: "Cleaner Text over artwork. Takes a few seconds per picture." },
+    Offer { title: "Qwen 2.5 VL 7B", model: READING_MODEL, size: "6.0 GB", gpu: "GPU 8 GB", note: "Reads menu text best. Used as the menu reading model, beside an image model for the English." },
+    Offer { title: "Gemma 3 12B", model: IMAGE_MODEL, size: "8.2 GB", gpu: "GPU 12 GB", note: "The one tested most with this app. Slower on 8 GB." },
     Offer { title: "Gemma 4 12B", model: "gemma4:12b", size: "8.0 GB", gpu: "GPU 12 GB", note: "Newer than Gemma 3. Not tested with this app yet." },
     Offer { title: "Gemma 4 26B", model: "gemma4:26b", size: "18.7 GB", gpu: "GPU 24 GB", note: "For big GPUs. Not tested with this app yet." },
     Offer { title: "Qwen 3.5 27B", model: "qwen3.5:27b", size: "17.5 GB", gpu: "GPU 24 GB", note: "For big GPUs. Not tested with this app yet." },
 ];
 
+/// What the All in one row gets: the set tested together, VN model first.
+pub const ALL_IN_ONE: [&str; 6] = [VN_MODEL, IMAGE_MODEL, READING_MODEL, TEXT_READER, FONT_PACK, INPAINTER];
+
+/// A model that reads pictures with another that writes: one good at reading Japanese in a picture
+/// can be poor at English.
+pub struct Pair<A, B> {
+    pub reads: A,
+    pub words: B,
+}
+
+impl<A: Chat, B: Chat> Chat for Pair<A, B> {
+    fn chat(&self, system: &str, user: &str) -> R<String> {
+        self.words.chat(system, user)
+    }
+    fn complete(&self, prompt: &str, temperature: f64) -> R<String> {
+        self.words.complete(prompt, temperature)
+    }
+    fn read_image(&self, png: &[u8], prompt: &str) -> R<String> {
+        self.reads.read_image(png, prompt)
+    }
+    fn model(&self) -> &str {
+        self.words.model()
+    }
+}
+
 /// Whether a row of Model Download is the app's own, with nothing to pick and no server involved.
 pub fn is_own(model: &str) -> bool {
-    model == TEXT_READER || model == FONT_PACK
+    model == TEXT_READER || model == FONT_PACK || model == INPAINTER
 }
 
 pub fn own_installed(model: &str) -> bool {
-    if model == FONT_PACK { crate::fonts::installed() } else { crate::ocr::installed() }
+    match model {
+        FONT_PACK => crate::fonts::installed(),
+        INPAINTER => crate::inpaint::installed(),
+        _ => crate::ocr::installed(),
+    }
 }
 
 /// Gets what a row of Model Download offers.
@@ -272,6 +310,7 @@ pub fn fetch(url: &str, model: &str, progress: &dyn Fn(u64, u64)) -> R<()> {
     match model {
         TEXT_READER => crate::ocr::download(progress),
         FONT_PACK => crate::fonts::download(progress),
+        INPAINTER => crate::inpaint::download(progress),
         _ => pull_model(url, model, progress),
     }
 }
@@ -429,6 +468,16 @@ pub(crate) mod tests {
         assert!(TEXT_OFFERS.iter().any(|o| o.model == VN_MODEL));
         assert!(IMAGE_OFFERS.iter().all(|o| !is_vntl(o.model)));
         assert_eq!(IMAGE_OFFERS[0].model, TEXT_READER);
+        // All in one gets only offered models, so each download shows its name and size
+        assert!(ALL_IN_ONE.iter().all(|m| TEXT_OFFERS.iter().chain(&IMAGE_OFFERS).any(|o| o.model == *m)));
+    }
+
+    #[test]
+    fn a_pair_reads_with_one_model_and_writes_with_the_other() {
+        let pair = Pair { reads: Fake(|_: &str| Ok("read".to_string())), words: Fake(|_: &str| Ok("words".to_string())) };
+        assert_eq!(pair.read_image(b"", "p").unwrap(), "read");
+        assert_eq!(pair.chat("", "p").unwrap(), "words");
+        assert_eq!(pair.complete("p", 0.0).unwrap(), "words");
     }
 
     /// Fake model: returns the given replies in order.

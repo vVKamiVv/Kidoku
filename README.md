@@ -47,7 +47,7 @@
 - **Uses what already exists.** On Ren'Py, lines from an official translation are copied instead of translated again.
 - **Shows its work.** Watch the Japanese and English arrive, or switch **SHOW LINES** off.
 - **Shows what it's using.** The Model tab shows VRAM, RAM and CPU use, live.
-- **Downloads models.** **Model Download** lists text and image models for 4 GB to 24 GB of graphics memory.
+- **Downloads models.** **Model Download** lists text and image models for 4 GB to 24 GB of graphics memory, and **All in one** gets the set tested together.
 
 <p align="center">
   <img src="docs/showcase-ja.webp" alt="A scene as the game ships it, in Japanese" width="49%">
@@ -71,7 +71,7 @@
 | **CatSystem2** | Messages, names and choices | Not yet | The passphrase is read from the game's program |
 | **Majiro** | Messages, names and choices | Not yet | ArcV3 archives only |
 | **YU-RIS** | Messages, names and choices | Not yet | The engine wraps lines itself, and may cut words |
-| **BGI/Ethornell** | Messages and names | Not yet | BURIKO ARC20 only |
+| **BGI/Ethornell** | Messages, names, menus and dialogs | Labels and buttons on menu screens | BURIKO ARC20 only |
 | **AdvHD** | Messages, names, choices, phone messages and the settings screen's sample lines | Not yet | Shift-JIS scripts only |
 | **KiriKiri** | Messages, shown tag values, and menus and dialogs in `.tjs` files | Not yet | `.ks` scripts in plain archives only |
 | **Artemis** | Messages, names, choices and pop-ups | Labels on plain backgrounds, and drawn names | Version 6 and 8 archives with `.iet` scripts only |
@@ -113,7 +113,7 @@ When a new version is out, Kidoku offers it at the top of its window. **What's n
 **Run it**
 
 1. Start Ollama, then open **Kidoku**.
-2. Under **Model Download**, press **Get** on the biggest text model your GPU holds. **VNTL Llama 8B** suits 8 GB.
+2. Under **Model Download**, press **Get** on **All in one**: the set tested together, 20.3 GB for a 12 GB GPU. Or get the biggest text model your GPU holds. **VNTL Llama 8B** suits 8 GB.
 3. On the **Game** tab, pick the game's folder.
 4. Press **Translate**, and start the game when it says Done.
 
@@ -159,7 +159,7 @@ vntl write <game>
 | `translate <game>` | Translates, resumes where it left off, and installs the result |
 | `write <game>` | Writes and checks the saved translation, without the model |
 | `fit <game> <image>` | Measures the message box from a screenshot of a long line |
-| `pull [model]` | Downloads a model into Ollama, the VN model by default. `pull meikiocr` gets the text reader |
+| `pull [model]` | Downloads a model into Ollama, the VN model by default. `pull meikiocr` gets the text reader, `pull lama` the inpainting model |
 | `vndb <game> [title or id]` | Fills in the synopsis, characters and descriptions from VNDB |
 
 | `translate` option | What it does |
@@ -168,6 +168,7 @@ vntl write <game>
 | `--url <address>` | The model server, Ollama by default |
 | `--history <6-24>` | Earlier lines a VN model sees |
 | `--vision-model <name>` | An image model, to read and repaint menu images |
+| `--reading-model <name>` | A model that reads menu images better, such as `qwen2.5vl:7b`. The image model still writes their English |
 | `--no-images` | Leaves menu images alone |
 | `--art` | Ren'Py: also paints English over text in artwork. Slow, and it can look edited |
 | `--reference <folder>` | A Ren'Py build with an official translation to copy from |

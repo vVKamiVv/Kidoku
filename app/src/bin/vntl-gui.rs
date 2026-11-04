@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use vntl::llm::{fetch, is_own, is_vntl, list_models, own_installed, Chat, Offer, Server, IMAGE_OFFERS, TEXT_OFFERS};
+use vntl::llm::{fetch, is_own, is_vntl, list_models, own_installed, Chat, Offer, Pair, Server, ALL_IN_ONE, IMAGE_MODEL, IMAGE_OFFERS, READING_MODEL, TEXT_OFFERS, VN_MODEL};
 use vntl::pipeline::{cache_file, import_game_data, links, load_characters, load_descriptions, load_synopsis, save_characters, save_description, save_synopsis, set_unlinked, translate, Character, Event, Options};
 use vntl::renpy::{detect, game_root, tl_dir, SUPPORTED};
 use vntl::usage::Sampler;
@@ -159,7 +159,7 @@ fn offers(engine: &str) -> EngineOptions {
         reference: renpy,
         scene: renpy || rpgmaker,
         scene_is_file: rpgmaker,
-        images: renpy || liarsoft || rpgmaker || engine == "artemis",
+        images: renpy || liarsoft || rpgmaker || engine == "artemis" || engine == "bgi",
         art: renpy || unity,
         retranslate: unity,
         redump: renpy,
@@ -340,10 +340,11 @@ fn load_settings(ui: &AppWindow) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
     let text = |key: &str| v[key].as_str().map(SharedString::from);
     v["check_updates"].as_bool().into_iter().for_each(|on| ui.set_check_updates(on));
-    let setters: [(&str, &dyn Fn(SharedString)); 5] = [
+    let setters: [(&str, &dyn Fn(SharedString)); 6] = [
         ("url", &|s| ui.set_url(s)),
         ("model", &|s| ui.set_model(s)),
         ("vision_model", &|s| ui.set_vision_model(s)),
+        ("reading_model", &|s| ui.set_reading_model(s)),
         ("game", &|s| ui.set_game(s)),
         ("reference", &|s| ui.set_reference(s)),
     ];
@@ -357,7 +358,7 @@ fn save_settings(ui: &AppWindow) {
     let path = settings_path();
     let v = serde_json::json!({
         "url": ui.get_url().as_str(), "model": ui.get_model().as_str(), "vision_model": ui.get_vision_model().as_str(),
-        "game": ui.get_game().as_str(), "reference": ui.get_reference().as_str(), "images": ui.get_images(), "history": ui.get_history(), "show_lines": ui.get_show_lines(),
+        "reading_model": ui.get_reading_model().as_str(), "game": ui.get_game().as_str(), "reference": ui.get_reference().as_str(), "images": ui.get_images(), "history": ui.get_history(), "show_lines": ui.get_show_lines(),
         "check_updates": ui.get_check_updates(),
     });
     // losing the remembered settings is harmless, so a failure here isn't worth interrupting anyone
@@ -367,7 +368,7 @@ fn save_settings(ui: &AppWindow) {
 
 fn refresh_models(ui: &AppWindow) {
     // read the choices now: until a list arrives, the boxes report an empty selection
-    let (model, vision) = (ui.get_model(), ui.get_vision_model());
+    let (model, vision, reading) = (ui.get_model(), ui.get_vision_model(), ui.get_reading_model());
     let (url, weak) = (ui.get_url().to_string(), ui.as_weak());
     let id = LAST_REFRESH.fetch_add(1, Ordering::Relaxed) + 1;
     std::thread::spawn(move || {
@@ -387,6 +388,9 @@ fn refresh_models(ui: &AppWindow) {
                 // menu images need a model that can see; VNTL models only read text
                 let seeing = ids.iter().find(|i| !is_vntl(i)).map_or("", |i| i.as_str());
                 ui.set_vision_model(if known(&vision) && !is_vntl(&vision) { vision } else { seeing.into() });
+                let seeing: Vec<SharedString> = std::iter::once(ui.get_same_as_image()).chain(ids.iter().filter(|i| !is_vntl(i)).map(|i| i.as_str().into())).collect();
+                ui.set_reading_choices(ModelRc::new(VecModel::from(seeing)));
+                ui.set_reading_model(if known(&reading) && !is_vntl(&reading) { reading } else { SharedString::new() });
             }
             Err(_) => {
                 ui.set_server_text(format!("Can't reach {url}").into());
@@ -421,7 +425,20 @@ fn offer_rows(offers: &[Offer], ids: &[String]) -> ModelRc<OfferRow> {
 fn show_offers(ui: &AppWindow, ids: &[String]) {
     ui.set_text_offers(offer_rows(&TEXT_OFFERS, ids));
     ui.set_image_offers(offer_rows(&IMAGE_OFFERS, ids));
+    let have = |m: &str| if is_own(m) { own_installed(m) } else { ids.iter().any(|i| i.eq_ignore_ascii_case(m)) };
+    ui.set_all_offer(OfferRow {
+        title: "All in one".into(),
+        model: ALL_IN_ONE_ROW.into(),
+        size: "20.3 GB".into(),
+        gpu: "GPU 12 GB".into(),
+        note: "VNTL Llama 8B for the story, Gemma 3 12B and Qwen 2.5 VL 7B for menus, and the text reader, fonts and inpainting. Gets what's missing.".into(),
+        installed: ALL_IN_ONE.iter().all(|m| have(m)),
+        always: false,
+    });
 }
+
+/// What the All in one row's Get asks for.
+const ALL_IN_ONE_ROW: &str = "all-in-one";
 
 fn pick_folder(set: impl Fn(SharedString)) {
     if let Some(dir) = rfd::FileDialog::new().set_title("Choose a folder").pick_folder() {
@@ -454,6 +471,19 @@ fn read_usage(ui: &AppWindow, sampler: Arc<Mutex<Sampler>>) {
     });
 }
 
+/// The image model, reading pictures with the menu reading model when there is one. Either alone
+/// does both.
+fn vision_chat(url: &str, vision: &str, reading: &str) -> Option<Box<dyn Chat + Send>> {
+    let server = |m: &str| Server::new(url, m, 0.2, 600);
+    match (vision, reading) {
+        ("", "") => None,
+        (v, "") => Some(Box::new(server(v))),
+        ("", r) => Some(Box::new(server(r))),
+        (v, r) if v == r => Some(Box::new(server(v))),
+        (v, r) => Some(Box::new(Pair { reads: server(r), words: server(v) })),
+    }
+}
+
 /// Asks for a screenshot of a long line, and measures the box from it.
 fn fit_box(ui: &AppWindow) {
     if ui.get_vision_model().is_empty() && !vntl::ocr::installed() {
@@ -463,7 +493,9 @@ fn fit_box(ui: &AppWindow) {
     let dialog = rfd::FileDialog::new().set_title("Choose a screenshot of a long message").add_filter("Screenshot", &["png", "jpg", "jpeg"]);
     let Some(image) = dialog.pick_file() else { return };
     let game = std::path::absolute(ui.get_game().trim()).unwrap_or_default();
-    let (url, model, weak) = (ui.get_url().to_string(), ui.get_vision_model().to_string(), ui.as_weak());
+    // a screenshot is read by the menu reading model when there is one
+    let reading = Some(ui.get_reading_model()).filter(|r| !r.is_empty()).unwrap_or(ui.get_vision_model());
+    let (url, model, weak) = (ui.get_url().to_string(), reading.to_string(), ui.as_weak());
     ui.set_status_text("Reading the screenshot…".into());
     std::thread::spawn(move || {
         let said = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))
@@ -497,8 +529,7 @@ fn start(ui: &AppWindow, cancel: &Arc<AtomicBool>, memory: &Arc<AtomicUsize>) {
         model: ui.get_model().to_string(),
         retranslate: ui.get_retranslate() && offered.retranslate,
         fresh: ui.get_fresh(),
-        vision: (!ui.get_vision_model().is_empty())
-            .then(|| Box::new(Server::new(ui.get_url().as_str(), ui.get_vision_model().as_str(), 0.2, 600)) as Box<dyn Chat + Send>),
+        vision: vision_chat(ui.get_url().as_str(), ui.get_vision_model().as_str(), ui.get_reading_model().as_str()),
         images: ui.get_images() && offered.images,
         art: ui.get_art() && offered.art,
         history: memory.clone(),
@@ -603,23 +634,44 @@ fn progress_bar(weak: slint::Weak<AppWindow>) -> impl Fn(u64, u64) {
 /// Downloads a recommended model and puts it to use. The bar shows the part being fetched: a model
 /// comes in several, and only one is big.
 fn get_model(ui: &AppWindow, model: String) {
-    let offers = || TEXT_OFFERS.iter().chain(&IMAGE_OFFERS);
-    let (title, size) = offers().find(|o| o.model == model).map_or(("the model", ""), |o| (o.title, o.size));
+    let about = |m: &str| TEXT_OFFERS.iter().chain(&IMAGE_OFFERS).find(|o| o.model == m).map_or(("the model", ""), |o| (o.title, o.size));
+    let all = model == ALL_IN_ONE_ROW;
+    // the set gets only what's missing: an Ollama model already there would be checked over again
+    let have: Vec<String> = ui.get_models().iter().map(|m| m.to_string()).collect();
+    let missing = |m: &&&str| if is_own(m) { !own_installed(m) } else { !have.iter().any(|h| h.eq_ignore_ascii_case(m)) };
+    let todo: Vec<String> = if all { ALL_IN_ONE.iter().filter(missing).map(|m| m.to_string()).collect() } else { vec![model.clone()] };
     let (url, weak) = (ui.get_url().to_string(), ui.as_weak());
     ui.set_fetching(true);
     clear_progress(ui);
-    ui.set_status_text(format!("Downloading {title} ({size})…").into());
     std::thread::spawn(move || {
         let shown = progress_bar(weak.clone());
-        let result = fetch(&url, &model, &shown);
+        let mut result = Ok(());
+        for (n, m) in todo.iter().enumerate() {
+            let (title, size) = about(m);
+            let said = if all { format!("Downloading {} of {}: {title} ({size})…", n + 1, todo.len()) } else { format!("Downloading {title} ({size})…") };
+            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(said.into()));
+            result = fetch(&url, m, &shown);
+            if result.is_err() {
+                break;
+            }
+        }
+        let title = if all { "All in one" } else { about(&model).0 };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_fetching(false);
             clear_progress(&ui);
             ui.set_status_text(if result.is_ok() { format!("Downloaded {title}.") } else { "Download failed  ·  see the log below.".to_string() }.into());
             match result {
+                Ok(()) if all => {
+                    ui.set_model(VN_MODEL.into());
+                    ui.set_vision_model(IMAGE_MODEL.into());
+                    ui.set_reading_model(READING_MODEL.into());
+                    refresh_models(&ui);
+                }
                 Ok(()) => {
                     if TEXT_OFFERS.iter().any(|o| o.model == model) {
                         ui.set_model(model.into());
+                    } else if model == READING_MODEL {
+                        ui.set_reading_model(model.into());
                     } else if !is_own(&model) {
                         ui.set_vision_model(model.into());
                     }
@@ -1040,6 +1092,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    ui.set_all_picks(ModelRc::new(VecModel::from(vec![SharedString::from(VN_MODEL), IMAGE_MODEL.into(), READING_MODEL.into()])));
     load_settings(&ui);
     detect_game(&ui, &shown);
     show_offers(&ui, &[]);
@@ -1055,6 +1108,16 @@ fn main() -> Result<(), slint::PlatformError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reading_model_reads_and_the_image_model_writes_and_either_alone_does_both() {
+        let url = "http://127.0.0.1:1";
+        assert!(vision_chat(url, "", "").is_none());
+        // the words go to the image model, whose name decides prompt formats
+        assert_eq!(vision_chat(url, "gemma3:12b", "qwen2.5vl:7b").unwrap().model(), "gemma3:12b");
+        assert_eq!(vision_chat(url, "", "qwen2.5vl:7b").unwrap().model(), "qwen2.5vl:7b");
+        assert_eq!(vision_chat(url, "gemma3:12b", "").unwrap().model(), "gemma3:12b");
+    }
 
     #[test]
     fn each_engine_is_offered_only_what_it_reads() {

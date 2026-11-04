@@ -651,14 +651,16 @@ fn load_cache(path: &Path, fresh: bool, log: &dyn Fn(String)) -> R<Cache> {
     Ok(cache)
 }
 
-/// Forget cached replies where the model kept going instead of stopping, so they're translated again.
+/// Forget cached replies where the model kept going instead of stopping, or that kept furigana (BGI's
+/// `<r…>`) the line no longer has, so they're translated again.
 fn drop_runaways<'a>(cache: &mut Cache, sources: impl Iterator<Item = (&'a String, &'a String)>, log: &dyn Fn(String)) {
+    let stale = |src: &str, tr: &str| runaway(src, tr) || (tr.contains("<r") && !src.contains("<r"));
     let bad: Vec<String> = sources
-        .filter(|(k, src)| cache.lines.get(*k).is_some_and(|tr| runaway(src, tr)))
+        .filter(|(k, src)| cache.lines.get(*k).is_some_and(|tr| stale(src, tr)))
         .map(|(k, _)| k.clone())
         .collect();
     if !bad.is_empty() {
-        log(format!("{} runaway translations (far longer than their Japanese) will be translated again", bad.len()));
+        log(format!("{} saved translations will be translated again: far longer than their Japanese, or holding furigana", bad.len()));
         bad.iter().for_each(|k| _ = cache.lines.shift_remove(k));
     }
 }
@@ -955,14 +957,22 @@ fn write_liar(game: &Path, cache: &Cache) -> R<String> {
     Ok(format!("Wrote {n} translated strings into scr.xfl (read back OK; originals kept as *.vntl-orig); {exe}.{lossy}{plates}{long}"))
 }
 
-/// Messages the English made longer than the text box holds, which the engine stops on. A model that
-/// takes instructions shortens them, two tries each per run; what still runs over stays Japanese.
-fn shorten_liar(model: &dyn Chat, lines: &[Line], cache: &mut Cache, log: &dyn Fn(String), cancel: &AtomicBool) -> R<()> {
-    let long: Vec<(&String, &String)> = lines.iter().filter(|(k, _, _)| cache.lines.get(k).is_some_and(|en| !liar::fits(en))).map(|(k, _, jp)| (k, jp)).collect();
+/// How English too long for where it's shown is made to fit: what fits, and at most how many
+/// characters to ask for, from the English and a share in tenths.
+struct Fit<'a> {
+    fits: &'a dyn Fn(&str) -> bool,
+    most: &'a dyn Fn(&str, usize) -> usize,
+    markup: &'a Regex,
+}
+
+/// Lines the English made longer than where they're shown holds. A model that takes instructions
+/// shortens them, two tries each per run.
+fn shorten(model: &dyn Chat, lines: &[Line], cache: &mut Cache, fit: &Fit, log: &dyn Fn(String), cancel: &AtomicBool) -> R<()> {
+    let long: Vec<(&String, &String)> = lines.iter().filter(|(k, _, _)| cache.lines.get(k).is_some_and(|en| !(fit.fits)(en))).map(|(k, _, jp)| (k, jp)).collect();
     if long.is_empty() {
         return Ok(());
     }
-    log(format!("Shortening {} messages that run past the text box", long.len()));
+    log(format!("Shortening {} lines too long for where the game shows them", long.len()));
     let mut fixed = 0;
     for (key, jp) in long {
         let en = cache.lines[key].clone();
@@ -970,12 +980,12 @@ fn shorten_liar(model: &dyn Chat, lines: &[Line], cache: &mut Cache, log: &dyn F
             if cancel.load(Ordering::Relaxed) {
                 return Err("Stopped".into());
             }
-            let most = en.chars().count() * liar::ROWS * share / (liar::rows(&en) * 10);
+            let most = (fit.most)(&en, share);
             let reply = model.chat(SYSTEM, &format!(
                 "This line from a Japanese visual novel is too long for its text box: \"{en}\" (Japanese: {jp}). Rewrite it in \
                  natural English in at most {most} characters, keeping what it says, its tone and any names. Reply with the line only."))?;
             let short = reply.trim().trim_matches('"').to_string();
-            if same_markup(&liar::MARKUP, jp, &short) && liar::fits(&short) {
+            if same_markup(fit.markup, jp, &short) && (fit.fits)(&short) {
                 cache.lines.insert(key.clone(), short);
                 fixed += 1;
                 break;
@@ -983,6 +993,25 @@ fn shorten_liar(model: &dyn Chat, lines: &[Line], cache: &mut Cache, log: &dyn F
         }
     }
     log(format!("  {fixed} shortened"));
+    Ok(())
+}
+
+/// Shortens what doesn't fit among `lines`, if the models can, and writes again.
+fn shorten_and_write(o: &Options, chat: &dyn Chat, lines: &[Line], fit: &Fit, write: &dyn Fn(&Cache) -> R<String>, log: &dyn Fn(String), cancel: &AtomicBool) -> R<()> {
+    let path = cache_file(&o.game, &o.lang);
+    let mut cache: Cache = load_json(&path)?;
+    if !lines.iter().any(|l| cache.lines.get(&l.0).is_some_and(|en| !(fit.fits)(en))) {
+        return Ok(());
+    }
+    let words = instruction_model(o, chat);
+    if is_vntl(words.model()) {
+        log("Long lines can be shortened by a model that takes instructions: pick an image model, then Translate again.".into());
+        return Ok(());
+    }
+    let run = shorten(words, lines, &mut cache, fit, log, cancel);
+    save_json(&path, &cache)?;
+    run?;
+    log(write(&cache)?);
     Ok(())
 }
 
@@ -1027,19 +1056,9 @@ fn translate_liar(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: 
     let log = |s: String| report(Event::Log(s));
     let lines = liar_lines(liar::texts(&o.game)?, &plate_names(o, &log)?);
     translate_script(o, chat, report, cancel, "Liar-soft", &lines, &liar::MARKUP, &|cache| write_liar(&o.game, cache))?;
-    let path = cache_file(&o.game, &o.lang);
-    let mut cache: Cache = load_json(&path)?;
-    if cache.lines.values().any(|t| !liar::fits(t)) {
-        let words = instruction_model(o, chat);
-        if is_vntl(words.model()) {
-            log("Long messages can be shortened by a model that takes instructions: pick an image model, then Translate again.".into());
-        } else {
-            let run = shorten_liar(words, &lines, &mut cache, &log, cancel);
-            save_json(&path, &cache)?;
-            run?;
-            log(write_liar(&o.game, &cache)?);
-        }
-    }
+    // what still runs over stays Japanese, as the engine stops on it
+    let most = |en: &str, share: usize| en.chars().count() * liar::ROWS * share / (liar::rows(en) * 10);
+    shorten_and_write(o, chat, &lines, &Fit { fits: &liar::fits, most: &most, markup: &liar::MARKUP }, &|cache| write_liar(&o.game, cache), &log, cancel)?;
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
         log(crate::menus::translate_menus(&o.game, vision.as_ref(), report, cancel)?);
         // menus are rebuilt from the game's own archive, which has the Japanese plates
@@ -1171,12 +1190,39 @@ fn write_artemis(game: &Path, cache: &Cache) -> R<String> {
 fn translate_artemis(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<()> {
     let lines = artemis::Game::open(&o.game)?.lines();
     translate_script(o, chat, report, cancel, "Artemis", &lines, &kirikiri::MARKUP, &|cache| write_artemis(&o.game, cache))?;
+    // a choice that wraps pushes the ones after it out of their boxes
+    let (keys, width) = artemis::Game::open(&o.game)?.one_row();
+    let row: Vec<Line> = lines.iter().filter(|l| keys.contains(&l.0)).cloned().collect();
+    // measured as the write measures it, with … as three dots
+    let fits = |en: &str| crate::text::wrap_words(&crate::text::ascii_punctuation(en), width).len() <= 1;
+    let most = |_: &str, share: usize| width * share / 10;
+    shorten_and_write(o, chat, &row, &Fit { fits: &fits, most: &most, markup: &kirikiri::MARKUP }, &|cache| write_artemis(&o.game, cache), &|s| report(Event::Log(s)), cancel)?;
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
         let cache: Cache = load_json(&cache_file(&o.game, &o.lang))?;
         let listed = listed_names(&o.game);
         let english = |jp: &str| english_name(&listed, &cache, jp).filter(|n| !n.is_empty() && !JA.is_match(n));
         report(Event::Log(crate::menus::translate_artemis_menus(&o.game, vision.as_ref(), &english, report, cancel)?));
         report(Event::Log(write_artemis(&o.game, &cache)?));
+    }
+    Ok(())
+}
+
+/// Write cached BGI translations into the archives, with any repainted menu pictures. Returns a summary line.
+fn write_bgi(game: &Path, cache: &Cache) -> R<String> {
+    let listed = listed_names(game);
+    let n = bgi::install(game, &|k| cache.lines.get(k).cloned(), &|name| english_name(&listed, cache, name))?;
+    Ok(format!("Wrote {n} translated strings into the game's archives (read back OK; the originals are kept as *.vntl-orig)."))
+}
+
+fn translate_bgi(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<()> {
+    let lines = bgi::Game::open(&o.game)?.lines();
+    translate_script(o, chat, report, cancel, "BGI", &lines, &NO_MARKUP, &|cache| write_bgi(&o.game, cache))?;
+    if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
+        let cache: Cache = load_json(&cache_file(&o.game, &o.lang))?;
+        let listed = listed_names(&o.game);
+        let english = |jp: &str| english_name(&listed, &cache, jp);
+        report(Event::Log(crate::menus::translate_bgi_menus(&o.game, vision.as_ref(), &english, report, cancel)?));
+        report(Event::Log(write_bgi(&o.game, &cache)?));
     }
     Ok(())
 }
@@ -1233,7 +1279,7 @@ static SCRIPT_ENGINES: [ScriptEngine; 16] = [
     engine_row!("catsystem2", catsystem, "CatSystem2", &NO_MARKUP, "strings into scene.int (read back OK; the original is kept as scene.int.vntl-orig).", named),
     engine_row!("majiro", majiro, "Majiro", &NO_MARKUP, "strings into scenario.arc (read back OK; the original is kept as scenario.arc.vntl-orig).", named),
     engine_row!("yu-ris", yuris, "YU-RIS", &NO_MARKUP, "strings into the script archive (read back OK; the original is kept as *.vntl-orig).", named),
-    engine_row!("bgi", bgi, "BGI", &NO_MARKUP, "strings into the game's archives (read back OK; the originals are kept as *.vntl-orig).", named),
+    ScriptEngine { id: "bgi", translate: translate_bgi, write: write_bgi, lines: |game| Ok(bgi::Game::open(game)?.lines().len()) },
     engine_row!("advhd", advhd, "AdvHD", &advhd::MARKUP, "strings into Rio*.arc (read back OK; the original is kept as Rio*.arc.vntl-orig).", named),
     engine_row!("softpal", softpal, "Softpal", &softpal::MARKUP, "strings into data.pac (read back OK; the original is kept as data.pac.vntl-orig).", named),
     engine_row!("fvp", fvp, "FVP", &NO_MARKUP, "strings into the .hcb script (read back OK; the original is kept as *.hcb.vntl-orig).", named),
@@ -1587,7 +1633,8 @@ mod tests {
             cache.lines.insert(k.into(), en.into());
         }
         let model = Scripted::new(&["A shorter line.", LONG, LONG]);
-        shorten_liar(&model, &lines, &mut cache, &|_| {}, &AtomicBool::new(false)).unwrap();
+        let most = |en: &str, share: usize| en.chars().count() * liar::ROWS * share / (liar::rows(en) * 10);
+        shorten(&model, &lines, &mut cache, &Fit { fits: &liar::fits, most: &most, markup: &liar::MARKUP }, &|_| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(cache.lines["a#1"], "A shorter line.");
         assert_eq!(cache.lines["a#2"], LONG, "two tries, then it stays as it was, and the write leaves it Japanese");
         assert_eq!(cache.lines["a#3"], "Short.", "what fits isn't asked about");

@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
-use vntl::llm::{fetch, Chat, Server, VN_MODEL};
+use vntl::llm::{fetch, Chat, Pair, Server, VN_MODEL};
 use vntl::pipeline::{script_engine, VNTL_HISTORY, translate, Event, Options};
 use vntl::renpy::{detect, extract, game_root, SUPPORTED};
 
@@ -62,6 +62,9 @@ enum Command {
         /// a vision model (e.g. gemma3:12b): also read, translate and repaint menu images
         #[arg(long)]
         vision_model: Option<String>,
+        /// a model that reads menu pictures better (e.g. qwen2.5vl:7b); --vision-model still writes their English
+        #[arg(long)]
+        reading_model: Option<String>,
         /// leave menu images alone, whatever --vision-model is
         #[arg(long)]
         no_images: bool,
@@ -169,9 +172,13 @@ fn run(cli: Cli) -> vntl::R<()> {
             let lines: usize = d.blocks.iter().map(|b| b.items.iter().filter(|i| i.is_say()).count()).sum();
             println!("Extracted {lines} lines, {} strings", d.strings.len());
         }
-        Command::Translate { label, file, lang, url, model, batch, temperature, timeout, reference, ui, redump, retranslate, fresh, vision_model, no_images, art, history, .. } => {
+        Command::Translate { label, file, lang, url, model, batch, temperature, timeout, reference, ui, redump, retranslate, fresh, vision_model, reading_model, no_images, art, history, .. } => {
             let chat = Server::new(&url, &model, temperature, timeout);
-            let vision = vision_model.map(|m| Box::new(Server::new(&url, &m, 0.2, timeout)) as Box<dyn Chat + Send>);
+            let server = |m: &str| Server::new(&url, m, 0.2, timeout);
+            let vision = match (vision_model, reading_model) {
+                (Some(v), Some(r)) if v != r => Some(Box::new(Pair { reads: server(&r), words: server(&v) }) as Box<dyn Chat + Send>),
+                (v, r) => v.or(r).map(|m| Box::new(server(&m)) as Box<dyn Chat + Send>),
+            };
             let o = Options { game, lang, label, file, reference, ui, redump, batch, model, retranslate, fresh, vision, images: !no_images, art, history: Arc::new(AtomicUsize::new(history.into())) };
             let report = |e: Event| {
                 if let Event::Log(s) = e {

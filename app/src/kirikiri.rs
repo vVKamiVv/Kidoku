@@ -12,7 +12,7 @@ use encoding_rs::SHIFT_JIS;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -35,7 +35,7 @@ const INLINE: &[&str] = &["emb"];
 const ENOUGH_ROWS: usize = 20;
 
 pub static MARKUP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
-static SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b(text|hint|jname|title|message|data)=("[^"]*"|'[^']*'|[^\s\]"']+)"#).unwrap());
+static SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\b(text\d*|hint|jname|title|message|data)=("[^"]*"|'[^']*'|[^\s\]"']+)"#).unwrap());
 
 fn u32_at(b: &[u8], p: usize) -> u32 {
     u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
@@ -388,7 +388,14 @@ pub(crate) struct Script {
     units: Vec<Unit>,
     /// `(line, start, end)` of names on lines of their own.
     names: Vec<(usize, usize, usize)>,
+    /// The values speaker tags give each variable a name is printed from, across the game.
+    said: BTreeMap<String, BTreeSet<String>>,
 }
+
+/// `[print data="$ '【' + chara + '】'"]`: a name printed from what a speaker tag set, often at size 0
+/// so only the log keeps it. The value stays Japanese, as the game compares it, so the print picks
+/// the English by it.
+static NAME_PRINT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\[print\s+data="\$\s*'([^'"]*)'\s*\+\s*(\w+)\s*\+\s*'([^'"]*)'"\s*\]"#).unwrap());
 
 /// Lengths of the rows the writers broke by hand, for how wide the box is.
 fn hand_rows(line: &str, parts: &[(usize, usize, bool)], out: &mut Vec<usize>) {
@@ -437,16 +444,20 @@ impl Script {
         let mut units: Vec<Unit> = Vec::new();
         let (mut names, mut speaking): (Vec<(usize, usize, usize)>, Option<String>) = (Vec::new(), None);
         let mut going: Option<Unit> = None; // text that may carry on in the next line
-        let (mut code, mut spread) = (false, false);
+        let (mut code, mut spread) = (false, None::<String>);
         for (n, row) in lines.iter().enumerate() {
             let line = row.text.as_str();
             let t = line.trim_start();
-            if spread {
-                spread = !t.contains(']');
-                if spread && JA.is_match(t) {
+            if let Some(tag) = spread.take() {
+                let closed = t.contains(']');
+                // a dialog's message runs on as plain lines; any other tag's lines hold values
+                if tag == "dialog" && !closed && JA.is_match(t) {
                     let (start, end) = (line.len() - t.len(), line.trim_end().len());
                     units.push(Unit { spans: vec![(n, start, end)], quotes: Vec::new(), last_text: end, open: None, body: t.trim_end().to_string(), attribute: false, in_value: true, who: None });
+                } else if tag != "dialog" {
+                    shown_values(line, n, 0, &tag, line, &mut units);
                 }
+                spread = (!closed).then_some(tag);
                 continue;
             }
             let command = t.strip_prefix(['[', '@']).unwrap_or("");
@@ -471,8 +482,12 @@ impl Script {
                 continue;
             }
             let Some(parts) = pieces(line) else {
+                // a tag running on over lines, as a choice with one value a line
                 units.extend(finish(going.take()));
-                spread = command.starts_with("dialog");
+                let open = line.rfind('[').unwrap_or(0);
+                let tag = line[open + 1..].split_whitespace().next().unwrap_or("").to_string();
+                shown_values(line, n, open, &tag, &line[open..], &mut units);
+                spread = Some(tag);
                 continue;
             };
             // what follows a tag can be a comment
@@ -525,12 +540,12 @@ impl Script {
                 quote = leftover;
                 run.clear();
                 if !flows {
-                    shown_values(line, n, start, piece, &mut units);
+                    shown_values(line, n, start, tag_name(piece), piece, &mut units);
                 }
             }
         }
         units.extend(finish(going));
-        Script { name, lines, coding, units, names }
+        Script { name, lines, coding, units, names, said: BTreeMap::new() }
     }
 
     /// Fills in who speaks where the tag starting a line stands for someone.
@@ -549,10 +564,47 @@ impl Script {
         }
     }
 
+    /// The keys of values shown from tags, as choices are: each on one row.
+    pub(crate) fn value_keys(&self) -> Vec<String> {
+        self.units.iter().filter(|u| u.attribute).map(|u| format!("{}:{}:{}", self.name, u.spans[0].0, u.spans[0].1)).collect()
+    }
+
+    /// The variables names are printed from, like `chara` in NAME_PRINT.
+    pub(crate) fn printed_names(&self) -> Vec<String> {
+        self.lines.iter().flat_map(|r| NAME_PRINT.captures_iter(&r.text).map(|c| c[2].to_string()).collect::<Vec<_>>()).collect()
+    }
+
+    /// The Japanese values this script's tags give `var`, like 太郎 in `[speak chara="太郎"]`.
+    pub(crate) fn values_of(&self, var: &str) -> Vec<String> {
+        let given = Regex::new(&format!(r#"\b{}="([^"']*)""#, regex::escape(var))).unwrap();
+        self.lines.iter().flat_map(|r| given.captures_iter(&r.text).map(|c| c[1].to_string()).collect::<Vec<_>>()).filter(|v| JA.is_match(v)).collect()
+    }
+
+    pub(crate) fn set_said(&mut self, said: BTreeMap<String, BTreeSet<String>>) {
+        self.said = said;
+    }
+
     /// The script with translations in, unchanged lines exactly as they were.
     pub(crate) fn with(&self, layout: &Layout, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> Option<(Vec<u8>, usize)> {
         let mut edits: Vec<(usize, usize, usize, String)> = Vec::new();
         let mut done = 0;
+        for (l, row) in self.lines.iter().enumerate() {
+            for c in NAME_PRINT.captures_iter(&row.text) {
+                let (whole, before, var, after) = (c.get(0).unwrap(), &c[1], &c[2], &c[3]);
+                let spelled: Vec<(&String, String)> = self.said.get(var).into_iter().flatten().filter_map(|jp| Some((jp, name(jp).filter(|en| !en.is_empty())?))).collect();
+                if spelled.is_empty() {
+                    continue;
+                }
+                let mut chain = String::new();
+                for (i, (jp, en)) in spelled.iter().enumerate() {
+                    let tag = if i == 0 { "if" } else { "elseif" };
+                    chain += &format!("[{tag} estimate=\"${var} == '{jp}'\"][print data=\"{before}{}{after}\"]", ascii_punctuation(en).replace(['"', '\''], ""));
+                }
+                chain += &format!("[else]{}[/if]", whole.as_str());
+                edits.push((l, whole.start(), whole.end(), chain));
+                done += 1;
+            }
+        }
         for u in &self.units {
             let (l, s, e) = u.spans[0];
             // a value that's a character's name keeps the spelling the list has for them
@@ -678,8 +730,7 @@ fn finish(u: Option<Unit>) -> Option<Unit> {
 
 /// Values that show on screen; the rest of a tag is the engine's, which may compare it, so it stays.
 /// `&` and `$` start code, not text.
-fn shown_values(line: &str, n: usize, at: usize, tag: &str, units: &mut Vec<Unit>) {
-    let name = tag_name(tag);
+fn shown_values(line: &str, n: usize, at: usize, name: &str, tag: &str, units: &mut Vec<Unit>) {
     if matches!(name, "ruby" | "eval" | "emb" | "if" | "elsif" | "ignore") {
         return;
     }
@@ -691,7 +742,7 @@ fn shown_values(line: &str, n: usize, at: usize, tag: &str, units: &mut Vec<Unit
         if !JA.is_match(body) || body.starts_with(['&', '$']) {
             continue;
         }
-        if matches!((name, &c[1]), (_, "text" | "hint" | "jname") | ("dialog", "title" | "message") | ("print" | "caption", "data")) {
+        if matches!((name, c[1].trim_end_matches(|d: char| d.is_ascii_digit())), (_, "text" | "hint" | "jname") | ("dialog", "title" | "message") | ("print" | "caption", "data")) {
             units.push(Unit { spans: vec![(n, s, e)], quotes: Vec::new(), last_text: e, open: None, body: body.to_string(), attribute: true, in_value: false, who: None });
         }
     }
@@ -946,6 +997,19 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_tag_over_several_lines_gives_each_shown_value_unwrapped() {
+        let script = "[select_scene num=\"2\"\r\n\ttext1=\"はい\" file1=\"a\" label1=\"1\"\r\n\ttext2=\"いいえ\" file2=\"a\" label2=\"2\"]\r\n地の文です\r\n";
+        assert_eq!(read(script), ["はい", "いいえ", "地の文です"]);
+        let s = Script::read("a".into(), &sjis(script), &mut Vec::new());
+        let layout = Layout { width: 6, row_break: "[rt]", rows: 3, page_break: "@[rp]" };
+        let (bytes, done) = s.with(&layout, &|_| Some("Yes I will go".into()), &|_| None).unwrap();
+        assert_eq!(done, 3);
+        let out = SHIFT_JIS.decode(&bytes).0;
+        assert!(out.contains("text1=\"Yes I will go\" file1") && out.contains("text2=\"Yes I will go\" file2"), "{out}");
+        assert!(out.ends_with("Yes I[rt]will[rt]go\r\n"), "only the story line is wrapped: {out}");
+    }
+
+    #[test]
     fn code_comments_labels_and_tags_are_not_text() {
         let script = "; 説明です\r\n*ラベル|見出し\r\n@jump storage=\"次\"\r\n[iscript]\r\nvar a = \"日本語\";\r\n[endscript]\r\n[eval exp=\"f.a='名前'\"]\r\n地の文です[p]\r\n";
         assert_eq!(read(script), ["地の文です"]);
@@ -1041,6 +1105,22 @@ mod tests {
     }
 
     #[test]
+    fn a_name_printed_for_the_log_picks_its_english_while_the_tag_keeps_its_japanese() {
+        let macros = "*speak\n[font size=0][print data=\"$ '【' + chara + '】'\"][/font]\n[return]\n";
+        let scene = "[speak chara=\"太郎\"]「はい」\n[speak chara=\"花子\"]「ええ」\n";
+        let (mut m, s) = (Script::read("macro".into(), &sjis(macros), &mut Vec::new()), Script::read("scene".into(), &sjis(scene), &mut Vec::new()));
+        assert_eq!(m.printed_names(), ["chara"]);
+        let said: BTreeMap<String, BTreeSet<String>> = [("chara".to_string(), s.values_of("chara").into_iter().collect())].into();
+        m.set_said(said);
+        let layout = Layout { width: 40, row_break: "[r]", rows: usize::MAX, page_break: "" };
+        let (bytes, count) = m.with(&layout, &|_| None, &|n| (n == "太郎").then(|| "Taro".to_string())).unwrap();
+        let text = SHIFT_JIS.decode_without_bom_handling(&bytes).0.into_owned();
+        assert_eq!(count, 1);
+        assert!(text.contains("[if estimate=\"$chara == '太郎'\"][print data=\"【Taro】\"][else][print data=\"$ '【' + chara + '】'\"][/if]"), "{text}");
+        assert!(!text.contains("花子"), "a name with no English keeps the game's own print");
+    }
+
+    #[test]
     fn lua_blocks_and_comments_after_tags_are_not_text() {
         assert_eq!(read("[lua]\r\n-- 説明\r\ne:tag{data=(\"日本語\")}\r\n[/lua]\r\n[wait]// 待つ処理\r\n地の文です[np]\r\n"), ["地の文です"]);
     }
@@ -1075,3 +1155,5 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 }
+
+

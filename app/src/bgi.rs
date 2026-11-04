@@ -2,13 +2,25 @@
 //! Compiled code refers to strings by offset into a block at the end of the script, so new text can
 //! go on the end and only those offsets change.
 
+use crate::artemis::painted;
+use crate::liar::Image;
 use crate::pipeline::Line;
 use crate::text::{ascii_punctuation, looks_like_name, sjis, wrap_words, JA};
 use crate::{backup, extend_file, R};
 use encoding_rs::SHIFT_JIS;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use regex::Regex;
+
+/// Furigana, `<rreading>word</r>`: small Japanese over a word. English needs none, so only the word is kept.
+static RUBY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<r[^>]*>(.*?)</r>").unwrap());
+
+fn without_ruby(text: &str) -> String {
+    RUBY.replace_all(text, "$1").into_owned()
+}
 
 fn word(b: &[u8], p: usize) -> R<usize> {
     Ok(u32::from_le_bytes(b.get(p..p + 4).ok_or("truncated BGI file")?.try_into().unwrap()) as usize)
@@ -265,7 +277,7 @@ impl Script {
             let text = self.string(m.text);
             if JA.is_match(&text) {
                 let who = m.name.map(|n| self.string(n)).filter(|n| JA.is_match(n));
-                out.push((format!("{}:{}", self.name, m.text), who, text.replace('\n', "")));
+                out.push((format!("{}:{}", self.name, m.text), who, without_ruby(&text.replace('\n', ""))));
             }
         }
     }
@@ -282,7 +294,7 @@ impl Script {
         };
         for m in &self.messages {
             let Some(tr) = line(&format!("{}:{}", self.name, m.text)) else { continue };
-            put(&mut out, m.text, &wrap_words(&ascii_punctuation(&tr), width).join("\n"));
+            put(&mut out, m.text, &wrap_words(&ascii_punctuation(&without_ruby(&tr)), width).join("\n"));
             done += 1;
             if let Some((n, en)) = m.name.and_then(|n| Some((n, name(&self.string(n))?))) {
                 put(&mut out, n, &en);
@@ -293,21 +305,219 @@ impl Script {
     }
 }
 
+// ---------- system programs ----------
+
+/// The archive of system programs: the menus, dialogs and settings screens.
+const PROGRAMS: &str = "sysprg.arc";
+/// In a system program, pushes the string as far from itself as the signed 16-bit value after it says.
+const PUSH_TEXT: u8 = 0x05;
+
+/// Where a system program's code pushes text, found by following the code from its start as the
+/// engine runs it: a 0x05 inside another instruction's operand is no push. Functions only reached
+/// through tables start right after a return, by taking stack room (0x10). None if the code holds an
+/// instruction this doesn't know, and then nothing in it is changed.
+fn text_pushes(plain: &[u8]) -> Option<Vec<usize>> {
+    let (mut todo, mut seen, mut out, mut rets) = (vec![16usize], BTreeSet::new(), Vec::new(), Vec::new());
+    loop {
+        if todo.is_empty() {
+            todo.extend(rets.drain(..).map(|r: usize| r + 1).filter(|&f| !seen.contains(&f) && plain.get(f) == Some(&0x10)));
+            if todo.is_empty() {
+                break;
+            }
+        }
+        let Some(mut p) = todo.pop() else { break };
+        while seen.insert(p) {
+            let op = *plain.get(p)?;
+            let next = match op {
+                PUSH_TEXT => {
+                    out.push(p);
+                    p + 3
+                }
+                // a code address: a jump, a branch, a call or just a value, by what follows it
+                0x06 => {
+                    let to = p as isize + i16::from_le_bytes([*plain.get(p + 1)?, *plain.get(p + 2)?]) as isize;
+                    todo.push(usize::try_from(to).ok()?);
+                    match *plain.get(p + 3)? {
+                        0x14 => break,
+                        0x15 => {
+                            todo.push(p + 5);
+                            break;
+                        }
+                        0x16 => p + 4,
+                        _ => p + 3,
+                    }
+                }
+                0x17 => {
+                    rets.push(p);
+                    break;
+                }
+                0x00 | 0x08..=0x0a | 0x80 | 0x81 | 0x90..=0x92 | 0xa0 | 0xb0 | 0xc0 | 0xff => p + 2,
+                0x01 | 0x04 | 0x0c => p + 3,
+                0x02 => p + 5,
+                0x0b => p + 2 + *plain.get(p + 1)? as usize,
+                0x10 | 0x11 | 0x14..=0x16 | 0x20..=0x2b | 0x30..=0x35 | 0x38..=0x3a | 0x40 | 0x42..=0x45 | 0x48 | 0x49 | 0x50..=0x5b | 0x5d..=0x71 | 0x74 | 0x75 | 0x77..=0x7f | 0xd0 | 0xe0 => p + 1,
+                _ => return None,
+            };
+            p = next;
+        }
+    }
+    Some(out)
+}
+
+/// In font names, which go to Windows and have to stay as Windows knows them.
+const FONT_WORDS: [&str; 2] = ["ゴシック", "明朝"];
+
+/// What a string in a system program reads as, if it's Japanese a player would see: not a font name
+/// and not a file.
+fn shown_text(raw: &[u8]) -> Option<String> {
+    let (text, _, bad) = SHIFT_JIS.decode(raw);
+    let looks_like_file = text.contains(['\\', '/']) || text.rsplit_once('.').is_some_and(|(_, ext)| (1..=4).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()));
+    let ok = !bad && JA.is_match(&text) && !text.chars().any(|c| c.is_control() && c != '\n') && !FONT_WORDS.iter().any(|f| text.contains(f)) && !looks_like_file;
+    ok.then(|| text.into_owned())
+}
+
+/// A system program (`._bp`): a 16-byte header giving the size of the rest, then code with its
+/// strings at the end, each reached by PUSH_TEXT.
+struct Program {
+    archive: usize,
+    item: usize,
+    name: String,
+    plain: Vec<u8>,
+    /// Each Japanese string's start, and the pushes that reach it.
+    strings: BTreeMap<usize, Vec<usize>>,
+}
+
+impl Program {
+    fn read(archive: usize, item: usize, name: String, plain: Vec<u8>) -> Option<Program> {
+        if plain.len() <= 16 || word(&plain, 0).ok()? != 16 || word(&plain, 4).ok()? != plain.len() - 16 {
+            return None;
+        }
+        let mut strings: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for q in text_pushes(&plain).unwrap_or_default() {
+            let at = q as isize + i16::from_le_bytes([plain[q + 1], plain[q + 2]]) as isize;
+            let at = usize::try_from(at).ok().filter(|&at| at > q + 3 && at < plain.len());
+            if let Some(at) = at.filter(|&at| shown_text(Self::raw(&plain, at)).is_some()) {
+                strings.entry(at).or_default().push(q);
+            }
+        }
+        Some(Program { archive, item, name, plain, strings })
+    }
+
+    fn raw(plain: &[u8], at: usize) -> &[u8] {
+        let tail = &plain[at..];
+        &tail[..tail.iter().position(|&c| c == 0).unwrap_or(tail.len())]
+    }
+
+    fn text(&self, at: usize) -> String {
+        shown_text(Self::raw(&self.plain, at)).unwrap_or_default()
+    }
+
+    fn key(&self, at: usize) -> String {
+        format!("{}:{at}", self.name)
+    }
+
+    fn lines(&self, out: &mut Vec<Line>) {
+        out.extend(self.strings.keys().map(|&at| (self.key(at), None, self.text(at))));
+    }
+
+    /// The program with new strings on the end and their pushes pointed at them. A character's name
+    /// keeps the spelling it has in the story, so a name the menus compare still matches.
+    fn with(&self, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> (Vec<u8>, usize) {
+        let mut out = self.plain.clone();
+        let mut done = 0;
+        for (&at, pushes) in &self.strings {
+            let jp = self.text(at);
+            let Some(tr) = name(&jp).or_else(|| line(&self.key(at))) else { continue };
+            let new_at = out.len();
+            // shortcut: a push reaches 32 KB ahead; past that a string keeps its Japanese
+            if pushes.iter().any(|&q| new_at - q > i16::MAX as usize) {
+                continue;
+            }
+            for &q in pushes {
+                out[q + 1..q + 3].copy_from_slice(&((new_at - q) as i16).to_le_bytes());
+            }
+            out.extend(sjis(&ascii_punctuation(&tr)));
+            out.push(0);
+            done += 1;
+        }
+        let rest = (out.len() - 16) as u32;
+        out[4..8].copy_from_slice(&rest.to_le_bytes());
+        (out, done)
+    }
+}
+
+// ---------- interface pictures ----------
+
+/// The archive of the menus' pictures.
+const PICTURES: &str = "sysgrp.arc";
+
+/// A picture as BGI stores it: width, height and bits per pixel (24 or 32) in a 16-byte header, then
+/// BGR(A) rows from the top.
+pub fn picture(b: &[u8]) -> Option<Image> {
+    let half = |p: usize| u16::from_le_bytes([b[p], b[p + 1]]) as usize;
+    if b.len() < 16 || b[6..16].iter().any(|&c| c != 0) {
+        return None;
+    }
+    let (w, h, bpp) = (half(0), half(2), half(4));
+    let step = bpp / 8;
+    if w == 0 || h == 0 || !(bpp == 24 || bpp == 32) || b.len() != 16 + w * h * step {
+        return None;
+    }
+    // stored alpha is inverted, 0 being opaque
+    let px = b[16..].chunks_exact(step).map(|c| u32::from_le_bytes([c[0], c[1], c[2], 255 - c.get(3).unwrap_or(&255)])).collect();
+    Some(Image { w, h, px })
+}
+
+/// `img` stored as `like` is: the same header, so the same bits per pixel.
+pub fn bitmap(like: &[u8], img: &Image) -> Vec<u8> {
+    let step = like[4] as usize / 8;
+    let mut out = like[..16].to_vec();
+    for p in &img.px {
+        let [b, g, r, a] = p.to_le_bytes();
+        out.extend(&[b, g, r, 255 - a][..step]);
+    }
+    out
+}
+
+/// The menus' pictures as the game has them: (name, stored bytes).
+pub fn interface_pictures(game: &Path) -> R<Vec<(String, Vec<u8>)>> {
+    let path = game.join(PICTURES);
+    let Some(a) = Archive::open(&path)? else { return Ok(Vec::new()) };
+    let mut f = fs::File::open(if backup(&path).exists() { backup(&path) } else { path.clone() }).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for item in &a.items {
+        let b = a.file(&mut f, item)?;
+        if picture(&b).is_some() {
+            out.push((item.name.clone(), b));
+        }
+    }
+    Ok(out)
+}
+
 // ---------- the game ----------
 
 pub struct Game {
     archives: Vec<Archive>,
     scripts: Vec<Script>,
+    programs: Vec<Program>,
 }
 
 impl Game {
     pub fn open(game: &Path) -> R<Game> {
-        let (mut archives, mut scripts) = (Vec::new(), Vec::new());
+        let (mut archives, mut scripts, mut programs) = (Vec::new(), Vec::new(), Vec::new());
         let mut paths: Vec<PathBuf> = fs::read_dir(game).map_err(|e| e.to_string())?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("arc"))).collect();
         paths.sort();
         for path in paths {
             let Some(a) = Archive::open(&path)? else { continue };
             let mut f = fs::File::open(if backup(&path).exists() { backup(&path) } else { path.clone() }).map_err(|e| e.to_string())?;
+            if path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(PROGRAMS)) {
+                for (i, item) in a.items.iter().enumerate() {
+                    let plain = a.file(&mut f, item).map_err(|e| format!("{}: {e}", item.name))?;
+                    programs.extend(Program::read(archives.len(), i, item.name.clone(), plain));
+                }
+                archives.push(a);
+                continue;
+            }
             for (i, item) in a.items.iter().enumerate() {
                 let mut top = [0; 16];
                 f.seek(SeekFrom::Start(item.place as u64)).and_then(|_| f.read_exact(&mut top)).map_err(|e| e.to_string())?;
@@ -320,13 +530,29 @@ impl Game {
             }
             archives.push(a);
         }
-        Ok(Game { archives, scripts })
+        Ok(Game { archives, scripts, programs })
     }
 
+    /// The story, then the menus and dialogs.
     pub fn lines(&self) -> Vec<Line> {
         let mut out = Vec::new();
         self.scripts.iter().for_each(|s| s.lines(&mut out));
+        self.programs.iter().for_each(|p| p.lines(&mut out));
         out
+    }
+
+    /// What the menus may say, as the game writes it: the system programs' text.
+    pub fn menu_words(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.programs.iter().for_each(|p| p.lines(&mut out));
+        out.into_iter().map(|l| l.2).collect()
+    }
+
+    /// Who speaks in the story.
+    pub fn speakers(&self) -> BTreeSet<String> {
+        let mut story = Vec::new();
+        self.scripts.iter().for_each(|s| s.lines(&mut story));
+        story.into_iter().filter_map(|l| l.1).collect()
     }
 }
 
@@ -334,13 +560,25 @@ impl Game {
 /// them back. Returns how many strings were written.
 pub fn install(game: &Path, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> R<usize> {
     let g = Game::open(game)?;
+    // repainted pictures wait beside the translation, since each write starts from the game's own archive
+    let pictures = painted(game)?;
     let mut done = 0;
     for (n, a) in g.archives.iter().enumerate() {
         let mut new = Vec::new();
+        if a.path.file_name().is_some_and(|f| f.eq_ignore_ascii_case(PICTURES)) {
+            new.extend(pictures.iter().filter_map(|(name, b)| Some((a.items.iter().position(|i| i.name == *name)?, b.clone()))));
+        }
         for s in g.scripts.iter().filter(|s| s.archive == n) {
             let (bytes, count) = s.with(crate::fit::letters(game, LINE_LETTERS), line, name);
             if count > 0 {
                 new.push((s.item, bytes));
+                done += count;
+            }
+        }
+        for p in g.programs.iter().filter(|p| p.archive == n) {
+            let (bytes, count) = p.with(line, name);
+            if count > 0 {
+                new.push((p.item, bytes));
                 done += count;
             }
         }
@@ -407,6 +645,69 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("data01000.arc"), archive(files)).unwrap();
         dir
+    }
+
+    /// A system program: pushes of the first string, a font name and a second string, an array whose
+    /// bytes look like a push of the first string, the first string again, and the strings after the code.
+    fn program() -> Vec<u8> {
+        let strings = [sjis("はじめから"), sjis("ＭＳ ゴシック"), sjis("設定")];
+        let mut at = vec![34usize];
+        for s in &strings[..2] {
+            at.push(at[at.len() - 1] + s.len() + 1);
+        }
+        let push = |q: usize, to: usize| [vec![PUSH_TEXT], ((to - q) as i16).to_le_bytes().to_vec()].concat();
+        let mut body = [push(16, at[0]), push(19, at[1]), push(22, at[2]), vec![0x0b, 3], push(27, at[0]), push(30, at[0]), vec![0x17]].concat();
+        strings.iter().for_each(|s| { body.extend(s); body.push(0); });
+        [16u32.to_le_bytes().to_vec(), (body.len() as u32).to_le_bytes().to_vec(), vec![0; 8], body].concat()
+    }
+
+    #[test]
+    fn a_system_program_gives_its_menu_text_and_takes_english_at_every_push() {
+        let own = program();
+        let p = Program::read(0, 0, "title._bp".into(), own.clone()).unwrap();
+        let mut lines = Vec::new();
+        p.lines(&mut lines);
+        assert_eq!(lines.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(), ["はじめから", "設定"], "the font name stays out");
+        let english = |k: &str| match lines.iter().position(|l| l.0 == k) { Some(0) => Some("Start".to_string()), Some(1) => Some("Settings".to_string()), _ => None };
+        let (out, done) = p.with(&english, &|_| None);
+        assert_eq!(done, 2);
+        let reached = |q: usize| SHIFT_JIS.decode(Program::raw(&out, q + i16::from_le_bytes([out[q + 1], out[q + 2]]) as usize)).0.into_owned();
+        assert_eq!([reached(16), reached(30), reached(22)], ["Start", "Start", "Settings"], "both pushes of a string follow it");
+        assert_eq!(reached(19), "ＭＳ ゴシック");
+        assert_eq!(out[25..30], own[25..30], "what only looks like a push inside the array is left alone");
+        assert_eq!(word(&out, 4).unwrap(), out.len() - 16, "the header has the new size");
+    }
+
+    #[test]
+    fn a_program_with_an_instruction_not_known_is_left_alone() {
+        let mut own = program();
+        own[19] = 0x03;
+        assert!(Program::read(0, 0, "title._bp".into(), own).unwrap().strings.is_empty());
+    }
+
+    #[test]
+    fn a_repainted_picture_goes_into_sysgrp_with_every_write() {
+        let mut own = [2u16, 1, 32].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        own.extend([0; 10]);
+        own.extend([1, 2, 3, 255, 4, 5, 6, 0]);
+        let img = picture(&own).unwrap();
+        assert_eq!(img.px, [0x00_03_02_01, 0xff_06_05_04], "BGRA, alpha inverted");
+        assert_eq!(bitmap(&own, &img), own);
+
+        let dir = game(&[("a", script())]);
+        fs::write(dir.join(PICTURES), archive(&[("SGButton", own.clone())])).unwrap();
+        let new = bitmap(&own, &Image { w: 2, h: 1, px: vec![0, 0] });
+        crate::artemis::keep_painted(&dir, &[("SGButton".into(), new.clone())]).unwrap();
+        install(&dir, &|_| None, &|_| None).unwrap();
+        assert_eq!(interface_pictures(&dir).unwrap()[0].1, own, "the game's own stays readable");
+        let a = Archive::open_as_written(&dir.join(PICTURES)).unwrap();
+        assert_eq!(a.file(&mut fs::File::open(dir.join(PICTURES)).unwrap(), &a.items[0]).unwrap(), new);
+    }
+
+    #[test]
+    fn furigana_leaves_only_its_word() {
+        assert_eq!(without_ruby("<rかみ>神</r>様と<rあくま>悪魔</r>"), "神様と悪魔");
+        assert_eq!(without_ruby("Plain <b>text</b>"), "Plain <b>text</b>");
     }
 
     #[test]

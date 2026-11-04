@@ -8,7 +8,7 @@ use crate::word;
 use crate::kirikiri::{box_width, Layout, Script};
 use crate::pipeline::Line;
 use crate::{backup, extend_file, files_under, ours, write_whole, R};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -256,6 +256,11 @@ impl Game {
         self.scripts.iter().for_each(|s| s.2.lines(&mut out));
         out
     }
+
+    /// The keys of values the game shows on one row, as choices, and how many letters a row holds.
+    pub fn one_row(&self) -> (Vec<String>, usize) {
+        (self.scripts.iter().flat_map(|s| s.2.value_keys()).collect(), self.width)
+    }
 }
 
 /// Every interface image as `(name, PNG)`, from the game's own archives.
@@ -316,9 +321,21 @@ pub(crate) fn painted(game: &Path) -> R<Vec<(String, Vec<u8>)>> {
 /// Writes the translations (`line` by key, `name` by the game's own text) into the archives and reads
 /// them back. Returns how many texts were written.
 pub fn install(game: &Path, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> R<usize> {
-    let g = Game::open(game)?;
+    let mut g = Game::open(game)?;
+    // speaker tags anywhere in the game, for the name a macro prints into the log
+    let printed: BTreeSet<String> = g.scripts.iter().flat_map(|s| s.2.printed_names()).collect();
+    let said: BTreeMap<String, BTreeSet<String>> = printed.into_iter().map(|v| {
+        let values = g.scripts.iter().flat_map(|s| s.2.values_of(&v)).collect();
+        (v, values)
+    }).collect();
+    g.scripts.iter_mut().for_each(|s| s.2.set_said(said.clone()));
     let layout = Layout { width: g.width, row_break: ROW_BREAK, rows: crate::fit::rows(game, BOX_ROWS), page_break: PAGE_BREAK };
     let images = painted(game)?;
+    // a choice that would wrap stays Japanese: it would push the ones after it out of their boxes
+    let (one_row, width) = g.one_row();
+    let one_row: BTreeSet<String> = one_row.into_iter().collect();
+    let fits = |k: &str| line(k).filter(|en| !one_row.contains(k) || crate::text::wrap_words(&crate::text::ascii_punctuation(en), width).len() <= 1);
+    let line: &dyn Fn(&str) -> Option<String> = &fits;
     let (mut done, mut patch) = (0, BTreeMap::new());
     for (a, archive) in g.archives.iter().enumerate() {
         let mut new = Vec::new();
@@ -436,6 +453,23 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_too_long_for_one_row_stays_japanese() {
+        let choice = "[select_scene num=\"2\"\r\n\ttext1=\"はい\" label1=\"1\"\r\n\ttext2=\"いいえ\" label2=\"2\"]\r\n";
+        let dir = game("root.pfs", pfs(b'6', &[("a.iet", sjis(choice))]));
+        std::fs::create_dir_all(dir.join("vntl_work")).unwrap();
+        fs::write(dir.join("vntl_work/box.txt"), "letters=10\n").unwrap();
+        let (keys, width) = Game::open(&dir).unwrap().one_row();
+        assert_eq!((keys.len(), width), (2, 10));
+        let line = |k: &str| Some(if k == keys[0] { "Yes" } else { "No, not at all" }.to_string());
+        install(&dir, &line, &|_| None).unwrap();
+        let path = dir.join("root.pfs");
+        let a = Archive::read(&path, &path).unwrap().unwrap();
+        let written = encoding_rs::SHIFT_JIS.decode(&a.file(&mut fs::File::open(&path).unwrap(), &a.items[0]).unwrap()).0.into_owned();
+        assert!(written.contains("text1=\"Yes\"") && written.contains("text2=\"いいえ\""), "{written}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn repainted_images_go_in_with_every_write_and_scene_art_is_not_offered() {
         let files = [("a.iet".to_string(), script()), ("image/t-start.png".to_string(), b"button".to_vec()), ("image/eyec/scene.png".to_string(), b"art".to_vec()), ("image/name_a.png".to_string(), b"name".to_vec())];
         let named: Vec<(&str, Vec<u8>)> = files.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
@@ -524,3 +558,4 @@ mod tests {
         assert_eq!(word(&b, first + 15), 2);
     }
 }
+

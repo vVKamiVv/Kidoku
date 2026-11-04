@@ -905,6 +905,11 @@ export component AppWindow inherits Window {
     in-out property <bool> images: true;
     in-out property <bool> art: false;
     in-out property <string> vision-model;
+    // reads menu pictures when set; the image model still writes their English
+    in-out property <string> reading-model;
+    in property <[string]> reading-choices;
+    // the first of the reading choices, which leaves reading-model empty
+    out property <string> same-as-image: "Same as image model";
     in property <[CharacterRow]> characters;
     in property <[LinkRow]> links;
     in-out property <string> vndb-query;
@@ -927,6 +932,9 @@ export component AppWindow inherits Window {
     in property <EngineOptions> offers;
     in property <[OfferRow]> text-offers;
     in property <[OfferRow]> image-offers;
+    // the set tested together, and its text, image and reading models in that order
+    in property <OfferRow> all-offer;
+    in property <[string]> all-picks;
     in property <bool> fetching; // a model is on its way
     in property <[LogRow]> rows;
     in property <int> widest; // columns of the longest row
@@ -1105,6 +1113,15 @@ export component AppWindow inherits Window {
                                         Drop { items: root.models; current: root.vision-model; label: "Image model"; list-width: parent.width; empty-text: "No models yet, see Model Download"; picked(value) => { root.vision-model = value; } }
                                     }
                                     Post {
+                                        title: "Menu reading model  ·  optional";
+                                        hint: "Reads the Japanese in menu pictures. The image model still writes their English.";
+                                        Drop {
+                                            items: root.reading-choices; current: root.reading-model == "" ? root.same-as-image : root.reading-model;
+                                            label: "Menu reading model"; list-width: parent.width; empty-text: "No models yet, see Model Download";
+                                            picked(value) => { root.reading-model = value == root.same-as-image ? "" : value; }
+                                        }
+                                    }
+                                    Post {
                                         title: "Memory  ·  VN models only";
                                         hint: "Earlier lines the model sees. More reads better, and it can change during a run.";
                                         Row {
@@ -1244,6 +1261,16 @@ export component AppWindow inherits Window {
                                 picks-form := VerticalLayout {
                                     x: 0px; y: 0px; width: pages.width; spacing: 8px; alignment: start;
                                     Post {
+                                        title: "All in one  ·  the set tested together";
+                                        hint: "Not sure which to get? Get this.";
+                                        Offer {
+                                            item: root.all-offer; busy: root.fetching || root.running;
+                                            chosen: root.model == root.all-picks[0] && root.vision-model == root.all-picks[1] && root.reading-model == root.all-picks[2];
+                                            get => { root.get-model(root.all-offer.model); }
+                                            pick => { root.model = root.all-picks[0]; root.vision-model = root.all-picks[1]; root.reading-model = root.all-picks[2]; }
+                                        }
+                                    }
+                                    Post {
                                         title: "Text models  ·  translate the story";
                                         hint: "Get the largest your graphics card holds.";
                                         for offer in root.text-offers: Offer {
@@ -1256,9 +1283,11 @@ export component AppWindow inherits Window {
                                         title: "Image models  ·  menus, names, genders";
                                         hint: "General models can refuse adult text.";
                                         for offer in root.image-offers: Offer {
-                                            item: offer; chosen: !offer.always && offer.model == root.vision-model; busy: root.fetching || root.running;
+                                            // the reading model is picked as one, not as the image model
+                                            item: offer; busy: root.fetching || root.running;
+                                            chosen: !offer.always && (offer.model == root.all-picks[2] ? offer.model == root.reading-model : offer.model == root.vision-model);
                                             get => { root.get-model(offer.model); }
-                                            pick => { root.vision-model = offer.model; }
+                                            pick => { if offer.model == root.all-picks[2] { root.reading-model = offer.model; } else { root.vision-model = offer.model; } }
                                         }
                                     }
                                 }
