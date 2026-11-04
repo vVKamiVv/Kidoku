@@ -114,12 +114,10 @@ fn near(a: u32, b: u32) -> bool {
 /// outer edge is often the same colour as the fill, but the frame itself cuts it off.
 fn spans(img: &Image, bg: u32) -> Vec<Option<(usize, usize)>> {
     let (w, h) = (img.w, img.h);
-    if bg == CLEAR {
-        return vec![Some((0, w - 1)); h]; // no frame to protect, and text may touch the image's edge
-    }
+    let back = |p: u32| if bg == CLEAR { !differs(p, CLEAR) } else { near(p, bg) };
     let (mut seen, mut inside) = (vec![false; w * h], Vec::new());
     for start in 0..w * h {
-        if seen[start] || !near(img.px[start], bg) {
+        if seen[start] || !back(img.px[start]) {
             continue;
         }
         seen[start] = true;
@@ -128,7 +126,7 @@ fn spans(img: &Image, bg: u32) -> Vec<Option<(usize, usize)>> {
             area.push(i);
             let (x, y) = (i % w, i / w);
             for (ok, n) in [(x > 0, i.wrapping_sub(1)), (x + 1 < w, i + 1), (y > 0, i.wrapping_sub(w)), (y + 1 < h, i + w)] {
-                if ok && !seen[n] && near(img.px[n], bg) {
+                if ok && !seen[n] && back(img.px[n]) {
                     seen[n] = true;
                     stack.push(n);
                 }
@@ -137,6 +135,12 @@ fn spans(img: &Image, bg: u32) -> Vec<Option<(usize, usize)>> {
         if area.len() > inside.len() {
             inside = area;
         }
+    }
+    // on nothing, text may touch the image's edge, so it has whole rows; unless the most nothing is
+    // shut in by a frame, as inside a pill-shaped tab, which stays
+    let edge = |i: &usize| i.is_multiple_of(w) || i % w == w - 1 || i / w == 0 || i / w == h - 1;
+    if bg == CLEAR && (inside.is_empty() || inside.iter().any(edge)) {
+        return vec![Some((0, w - 1)); h];
     }
     let mut out: Vec<Option<(usize, usize)>> = vec![None; h];
     for i in inside {
@@ -294,6 +298,19 @@ fn block_image(part: &Part, b: &Block, scale: usize) -> Image {
                 (top * (1.0 - dy) + low * dy) as u32
             };
             px.push(mix(0) << 16 | mix(1) << 8 | mix(2));
+        }
+    }
+    // pale lettering on a pale face, as a lit-up button's, is misread as drawn: it's shown black on white
+    if part.bg >> 24 == 0 {
+        let luma = |p: u32| rgb(p).iter().sum::<i32>() / 3;
+        let face = luma(part.bg);
+        let ink = b.mask.iter().enumerate().filter(|(_, m)| **m).map(|(i, _)| img.px[(b.y0 + i / bw) * img.w + b.x0 + i % bw]);
+        let far = ink.map(|p| (luma(p) - face).abs()).max().unwrap_or(0);
+        if (1..80).contains(&far) {
+            for p in px.iter_mut() {
+                let g = (255 - ((luma(*p) - face).abs() * 255 / far).min(255)) as u32;
+                *p = g << 16 | g << 8 | g;
+            }
         }
     }
     Image { w, h, px }
@@ -634,10 +651,12 @@ fn repaint(part: &Part, labels: &[Option<&String>], font: &Font) -> R<Image> {
             }
         }
         let share = |test: &dyn Fn(i32) -> bool| ink.iter().filter(|c| test((c[0] + c[1] + c[2]) / 3)).count() * 100 / ink.len().max(1);
-        let outlined = (share(&|v| v >= 200) >= 15 && share(&|v| v <= 50) >= 15) || (90..=170).contains(&luma);
+        let rim_light = rim.iter().filter(|c| (c[0] + c[1] + c[2]) / 3 >= 200).count() * 100 / rim.len().max(1);
+        // a thick light outline can leave thin dark letters a small share, but its edge is all light
+        let outlined = (share(&|v| v >= 200) >= 15 && share(&|v| v <= 50) >= 15) || (90..=170).contains(&luma) || (rim_light >= 90 && share(&|v| v <= 50) >= 8);
         let clear = part.bg == CLEAR;
         // an outline is usually dark round light letters, and sometimes light round dark ones
-        let light_edge = outlined && rim.iter().filter(|c| (c[0] + c[1] + c[2]) / 3 >= 200).count() * 2 >= rim.len();
+        let light_edge = outlined && rim_light >= 50;
         // with nothing behind it, the text keeps its own colour; on a button, it contrasts with the fill.
         // an outlined label's own colour is what lies inside its outline
         let inner = |v: i32| if light_edge { v <= 50 } else { v >= 200 };
@@ -896,7 +915,8 @@ impl<'a> Job<'a> {
     /// model takes seconds each.
     fn read(&mut self, part: &Part, b: &Block, scale: usize) -> R<String> {
         if self.vision_first {
-            let img = block_image(part, b, scale);
+            // tiny lettering, as an 8 px label on a colour picker, is read as made-up words unless shown larger
+            let img = block_image(part, b, scale.max(72 / (b.y1 - b.y0).max(1)));
             let png = write_png(&img)?;
             if let Some(text) = self.read_before.get(&png) {
                 return Ok(text.clone());
@@ -934,11 +954,20 @@ impl<'a> Job<'a> {
         if !(JA.is_match(&seen) && shared) && !shows_japanese(self.vision, png)? {
             return Ok(String::new());
         }
+        // a reading that is just the name of someone in the story is the game's own word, as ハナ that
+        // the model takes for 八ナ: letters that alike, the picture can't settle
+        let named = |t: &str| self.people.iter().any(|p| p.iter().copied().eq(t.chars()));
+        if let Some(name) = [&text, &seen].into_iter().find(|t| named(t)) {
+            return Ok(name.clone());
+        }
+        // past the check above, a "no Japanese here" from the comparison is a picture too small or
+        // faint to compare letters on, as an 8 px label, not a reason to drop the reading
+        let compare = |a: &str, b: &str| Ok::<_, String>(choose(self.vision, png, a, b)?.filter(|p| !p.is_empty()));
         // the model misreads a letter, as シャ for ジャ, which the game's own text or the reader may
         // have right: shown both, it finds which the picture says. Where it can't tell, the game's
         // own word stands, but not the reader's, which swaps letters as often as the model
         if let Some(word) = nearest(&self.words, &text).or_else(|| nearest_name(&self.people, &text)) {
-            return Ok(choose(self.vision, png, &word, &text)?.unwrap_or(word));
+            return Ok(compare(&word, &text)?.unwrap_or(word));
         }
         if seen == text || !JA.is_match(&seen) {
             return Ok(text);
@@ -946,7 +975,7 @@ impl<'a> Job<'a> {
         // where the picture doesn't settle it, the real word beside the others on its screen does,
         // as いいえ beside はい; failing that, both go to the translation as readings of one label,
         // the reader's first: what neither settles, the model had made up, as レスキュー for いいえ
-        let picked = match choose(self.vision, png, &text, &seen)? {
+        let picked = match compare(&text, &seen)? {
             Some(p) => Some(p),
             None => likelier(self.vision, &text, &seen, &self.nearby)?,
         };
@@ -983,6 +1012,56 @@ impl<'a> Job<'a> {
             (self.report)(Event::Log(format!("{missed} labels in {screen} stay in Japanese; run again to retry them.")));
         }
         Ok(())
+    }
+
+    /// Labels on one picture that read differently but got the same English, as 停止 and 一時停止 both
+    /// "Pause", go back to the model together, told they are different buttons and what the picture's
+    /// other labels say. Only this run's (`todo`), and not a label's other states, which are drawn alike.
+    fn tell_apart(&mut self, parts: &[Part], groups: &[Group], todo: &[(String, usize, String)]) -> R<()> {
+        // the labels that clash, each set once: (their English, the other labels beside them)
+        let mut sets: IndexMap<BTreeSet<String>, (String, BTreeSet<String>)> = IndexMap::new();
+        for entry in parts.iter().map(|p| p.entry).collect::<BTreeSet<_>>() {
+            let here: Vec<(&Block, String)> = parts.iter().filter(|p| p.entry == entry).flat_map(|p| &p.blocks)
+                .map(|b| (b, groups[b.group].reads.join(BOTH))).filter(|(_, k)| self.labels.contains_key(k)).collect();
+            let ours = |k: &String| todo.iter().any(|t| t.0 == *k);
+            let mut clash: IndexMap<String, BTreeSet<String>> = IndexMap::new();
+            for (i, (a, ka)) in here.iter().enumerate() {
+                for (b, kb) in &here[i + 1..] {
+                    let en = &self.labels[ka];
+                    if kb != ka && ours(ka) && ours(kb) && self.labels[kb].eq_ignore_ascii_case(en) && !same_text(a, b, 80) {
+                        clash.entry(en.clone()).or_default().extend([ka.clone(), kb.clone()]);
+                    }
+                }
+            }
+            for (en, keys) in clash {
+                let others: Vec<String> = here.iter().map(|(_, k)| k).filter(|k| !keys.contains(*k)).cloned().collect();
+                sets.entry(keys).or_insert((en, BTreeSet::new())).1.extend(others);
+            }
+        }
+        for (keys, (en, others)) in sets {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("Stopped".into());
+            }
+            let taken: BTreeSet<String> = others.iter().map(|k| self.labels[k].to_lowercase()).collect();
+            let beside: Vec<String> = others.iter().map(|k| format!("{k} ({})", self.labels[k])).collect();
+            let keys: Vec<String> = keys.into_iter().collect();
+            let lines: Vec<String> = keys.iter().enumerate().map(|(i, k)| format!("{}: {k}", i + 1)).collect();
+            let prompt = format!(
+                "These labels sit on one screen of a game's menus. They are different buttons, yet each was given the same \
+                 English, \"{en}\". Give each its own concise English, as a game menu would show it{}. \
+                 Reply with exactly {} lines formatted '<number>: <English>' and nothing else.\n\n{}",
+                if beside.is_empty() { String::new() } else { format!(", unlike the screen's other labels: {}", beside.join(", ")) },
+                keys.len(),
+                lines.join("\n")
+            );
+            let Some(reply) = parse_numbered(&self.vision.chat("", &prompt)?, keys.len()) else { continue };
+            let new: Option<Vec<String>> = keys.iter().zip(&reply).map(|(k, e)| paintable(e, k)).collect();
+            // each different, and none what another label beside them already says
+            let lower: Option<BTreeSet<String>> = new.as_ref().map(|n| n.iter().map(|e| e.to_lowercase()).collect());
+            let Some(new) = new.filter(|n| lower.is_some_and(|l| l.len() == n.len() && l.is_disjoint(&taken))) else { continue };
+            self.labels.extend(keys.into_iter().zip(new));
+        }
+        save_labels(&self.labels_path, &self.labels)
     }
 
     /// Ask for shorter English for the labels in `long`, each to fit the characters given.
@@ -1066,13 +1145,15 @@ impl<'a> Job<'a> {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err("Stopped".into());
             }
-            let on = read_on.entry(parts[g.first.0].entry).or_default();
-            self.nearby = on.clone();
+            // what a label says is read on each picture it's drawn on, its look-alike's too
+            self.nearby = read_on.get(&parts[g.first.0].entry).cloned().unwrap_or_default();
+            let pictures: Vec<usize> = [Some(g.first), g.second].into_iter().flatten().map(|(p, _)| parts[p].entry).collect();
+            let mut note = |reads: &[String]| pictures.iter().for_each(|e| read_on.entry(*e).or_default().extend(reads.iter().take(1).cloned()));
             // a look-alike the image model reads differently is another label, as 右 beside 左
             let other = g.second.filter(|_| self.vision_first).map(|(c, d)| (c, d, format!("{screen}|{}#{d}", parts[c].name)));
             if let Some(r) = self.cached.get(&g.key) {
                 g.reads = r.clone();
-                on.extend(r.iter().take(1).cloned());
+                note(r);
                 split.extend(other.filter(|o| self.cached.contains_key(&o.2)));
                 continue;
             }
@@ -1102,7 +1183,7 @@ impl<'a> Job<'a> {
             // a reading that is another plus extra characters is that reading with junk on the end
             let all = g.reads.clone();
             g.reads.retain(|r| !all.iter().any(|o| o != r && r.starts_with(o.as_str())));
-            read_on.entry(parts[a].entry).or_default().extend(g.reads.iter().take(1).cloned());
+            note(&g.reads);
             self.cached.insert(g.key.clone(), g.reads.clone());
             save_json(&self.reads_path, &self.cached)?;
         }
@@ -1139,6 +1220,7 @@ impl<'a> Job<'a> {
         let todo: Vec<(String, usize, String)> =
             groups.iter().filter(|g| !g.reads.is_empty() && !self.labels.contains_key(&key(g))).map(|g| (key(g), room(g), hint(g))).collect();
         self.translate_labels(screen, &todo)?;
+        self.tell_apart(parts, &groups, &todo)?;
         let samples: Vec<Sample> = groups.iter().filter(|g| !g.reads.is_empty()).take(SAMPLES).map(|g| sample(&parts[g.first.0].blocks[g.first.1], &g.reads[0])).collect();
         if !self.matched && !samples.is_empty() {
             self.font = matched_font(&self.game, "menus", &samples)?;
@@ -1640,11 +1722,78 @@ fn first_mark(b: &Block) -> Option<(usize, Vec<bool>, usize, usize)> {
     Some((next, (top..bottom).flat_map(|y| (0..gap).map(move |x| b.mask[y * w + x])).collect(), gap, bottom - top))
 }
 
+/// Columns `from..to` of a block.
+fn columns_of(b: &Block, from: usize, to: usize) -> Block {
+    let w = b.x1 - b.x0;
+    let mask = (0..b.y1 - b.y0).flat_map(|y| b.mask[y * w + from..y * w + to].to_vec()).collect();
+    Block { x0: b.x0 + from, y0: b.y0, x1: b.x0 + to, y1: b.y1, mask, group: b.group }
+}
+
 /// The block from column `next` on.
 fn cut_block(b: &mut Block, next: usize) {
+    *b = columns_of(b, next, b.x1 - b.x0);
+}
+
+/// A mark with nothing in its middle, as a checkbox has.
+fn hollow(mask: &[bool], w: usize, h: usize) -> bool {
+    w >= 7 && h >= 7 && (h / 4..h - h / 4).all(|y| (w / 4..w - w / 4).all(|x| !mask[y * w + x]))
+}
+
+/// How many of `marks` have this mark's size and nearly all its pixels.
+fn alike(marks: &[&(usize, Vec<bool>, usize, usize)], mask: &[bool], w: usize, h: usize) -> usize {
+    marks.iter().filter(|o| (o.2, o.3) == (w, h) && o.1.iter().zip(mask).filter(|(a, b)| a != b).count() * 20 <= mask.len()).count()
+}
+
+/// The block's dark strokes only: a box can touch the text's light edge, and stands apart in these.
+fn dark_strokes(img: &Image, b: &Block) -> Block {
     let w = b.x1 - b.x0;
-    b.mask = (0..b.y1 - b.y0).flat_map(|y| b.mask[y * w + next..(y + 1) * w].to_vec()).collect();
-    b.x0 += next;
+    let mask = b.mask.iter().enumerate().map(|(i, m)| *m && rgb(img.px[(b.y0 + i / w) * img.w + b.x0 + i % w]).iter().sum::<i32>() < 300).collect();
+    Block { mask, ..b.clone() }
+}
+
+/// The columns of the checkboxes like those `marks` hold inside a block, past its first stroke.
+fn boxes_in(b: &Block, marks: &[&(usize, Vec<bool>, usize, usize)]) -> Vec<(usize, usize)> {
+    let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+    let inked = |x: usize| (0..h).any(|y| b.mask[y * w + x]);
+    let mut out = Vec::new();
+    let mut x = (0..w).find(|&x| !inked(x)).unwrap_or(w);
+    while let Some(s) = (x..w).find(|&x| inked(x)) {
+        x = (s..w).find(|&x| !inked(x)).unwrap_or(w);
+        let rows: Vec<usize> = (0..h).filter(|&y| (s..x).any(|c| b.mask[y * w + c])).collect();
+        let (top, bottom) = (rows[0], rows[rows.len() - 1] + 1);
+        let mask: Vec<bool> = (top..bottom).flat_map(|y| (s..x).map(move |c| (y, c))).map(|(y, c)| b.mask[y * w + c]).collect();
+        if hollow(&mask, x - s, bottom - top) && alike(marks, &mask, x - s, bottom - top) >= 3 {
+            out.push((s, x));
+        }
+    }
+    out
+}
+
+/// A block parted where a checkbox sits inside it, as in "□Auto load □Data lock": the text either
+/// side is a label of its own, and the box stays as it is.
+fn split_at_boxes(b: Block, img: &Image, marks: &[&(usize, Vec<bool>, usize, usize)]) -> Vec<Block> {
+    let dark = dark_strokes(img, &b);
+    let mut boxes = boxes_in(&b, marks);
+    boxes.extend(boxes_in(&dark, marks));
+    boxes.sort();
+    let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+    let inked = |m: &[bool], x: usize| (0..h).any(|y| m[y * w + x]);
+    let (mut out, mut from) = (Vec::new(), 0);
+    for (s, e) in boxes.into_iter().filter(|&(s, _)| s > 0) {
+        if s < from {
+            continue;
+        }
+        if let Some(end) = (from..s).rfind(|&x| inked(&b.mask, x)) {
+            out.push(columns_of(&b, from, end + 1));
+        }
+        // the next label starts at its letters, not at a light edge touching the box, which a repaint
+        // would wipe the box's side with
+        from = (e..w).find(|&x| inked(&dark.mask, x)).or_else(|| (e..w).find(|&x| inked(&b.mask, x))).unwrap_or(w);
+    }
+    if from < w {
+        out.push(columns_of(&b, from, w));
+    }
+    out
 }
 
 /// Marks before a label's text stay as they are, and its block starts after them: anything in a
@@ -1664,7 +1813,7 @@ fn strip_marks(parts: &mut [Part]) {
             n
         };
         for b in part.blocks.iter_mut() {
-            while let Some((next, _, w, h)) = first_mark(b) {
+            while let Some((next, mask, w, h)) = first_mark(b) {
                 let (mark, rest) = (colours(b, 0..w), colours(b, next..b.x1 - b.x0));
                 let Some((c, _)) = mark.into_iter().max_by_key(|(_, n)| *n) else { break };
                 let total: usize = rest.values().sum();
@@ -1672,7 +1821,9 @@ fn strip_marks(parts: &mut [Part]) {
                 let rest_h = (0..b.y1 - b.y0).filter(|&y| (next..bw).any(|x| b.mask[y * bw + x])).count();
                 // a dot of a dotted line is far smaller than any letter
                 let dot = h * 3 <= rest_h && w * 3 <= rest_h;
-                if bw - next < 14 || (!dot && rest.get(&c).copied().unwrap_or(0) * 20 >= total) {
+                // and an icon drawn solid, as ■, is no letter: a solid stroke is thin, as リ's first, or flat, as ー
+                let solid = h >= 6 && h * 2 >= w && w * 2 >= h && mask.iter().filter(|m| **m).count() * 10 >= mask.len() * 9;
+                if bw - next < 14 || (!dot && !solid && rest.get(&c).copied().unwrap_or(0) * 20 >= total) {
                     break;
                 }
                 cut_block(b, next);
@@ -1680,36 +1831,33 @@ fn strip_marks(parts: &mut [Part]) {
         }
     }
     // a box can touch the text's light edge, so it's looked for in the dark strokes too
-    let dark: Vec<Vec<Block>> = parts.iter().map(|part| part.blocks.iter().map(|b| {
-        let (img, w) = (&part.img, b.x1 - b.x0);
-        let mask = b.mask.iter().enumerate().map(|(i, m)| *m && rgb(img.px[(b.y0 + i / w) * img.w + b.x0 + i % w]).iter().sum::<i32>() < 300).collect();
-        Block { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, mask, group: b.group }
-    }).collect()).collect();
+    let dark: Vec<Vec<Block>> = parts.iter().map(|part| part.blocks.iter().map(|b| dark_strokes(&part.img, b)).collect()).collect();
     let normal: Vec<Vec<Block>> = parts.iter().map(|p| p.blocks.clone()).collect();
     let mut cuts: Vec<Vec<Option<usize>>> = parts.iter().map(|p| vec![None; p.blocks.len()]).collect();
-    for view in [&normal, &dark] {
-        let marks: Vec<Vec<_>> = view.iter().map(|bs| bs.iter().map(first_mark).collect()).collect();
+    let marks: Vec<Vec<Vec<_>>> = [&normal, &dark].iter().map(|view| view.iter().map(|bs| bs.iter().map(first_mark).collect()).collect()).collect();
+    for (view, marks) in [&normal, &dark].into_iter().zip(&marks) {
         let all: Vec<_> = marks.iter().flatten().flatten().collect();
         for (p, bs) in view.iter().enumerate() {
             for (i, b) in bs.iter().enumerate() {
                 let Some((next, mask, w, h)) = marks[p][i].as_ref().filter(|_| cuts[p][i].is_none()) else { continue };
-                let alike = all.iter().filter(|o| (o.2, o.3) == (*w, *h) && o.1.iter().zip(mask).filter(|(a, b)| a != b).count() * 20 <= mask.len()).count();
-                let hollow = *w >= 7 && *h >= 7 && (h / 4..h - h / 4).all(|y| (w / 4..w - w / 4).all(|x| !mask[y * w + x]));
                 let bw = b.x1 - b.x0;
                 let rest = (0..b.y1 - b.y0).filter(|&y| (*next..bw).any(|x| b.mask[y * bw + x])).count();
                 // a box taller than the text beside it is no letter
-                if hollow && (alike >= 3 || h * 10 >= rest * 13) {
+                if hollow(mask, *w, *h) && (alike(&all, mask, *w, *h) >= 3 || h * 10 >= rest * 13) {
                     cuts[p][i] = Some(*next);
                 }
             }
         }
     }
+    let all: Vec<_> = marks.iter().flatten().flatten().flatten().collect();
     for (part, cuts) in parts.iter_mut().zip(cuts) {
-        for (b, next) in part.blocks.iter_mut().zip(cuts) {
+        let blocks: Vec<Block> = std::mem::take(&mut part.blocks).into_iter().zip(cuts).flat_map(|(mut b, next)| {
             if let Some(next) = next {
-                cut_block(b, next);
+                cut_block(&mut b, next);
             }
-        }
+            split_at_boxes(b, &part.img, &all)
+        }).collect();
+        part.blocks = blocks;
     }
 }
 
@@ -1763,17 +1911,30 @@ fn join_lines(mut blocks: Vec<Block>) -> Vec<Block> {
 /// labels lying on nothing, the faces of solid shapes (buttons, with their text inside), and the
 /// same again inside any group of shapes too tall to be a label. Each comes before what's inside it.
 fn sheet_parts(entry: usize, name: &str, img: Image, at: (usize, usize), parts: &mut Vec<Part>) {
-    let inside: Vec<Block> = shapes(&img, CLEAR).into_iter().filter(|s| (s.x1 - s.x0, s.y1 - s.y0) != (img.w, img.h) && (is_solid(s) || s.y1 - s.y0 > TALLEST_LABEL)).collect();
+    let cut = |img: &Image, (x0, y0, x1, y1): Area| Image { w: x1 - x0, h: y1 - y0, px: (y0..y1).flat_map(|y| img.px[y * img.w + x0..y * img.w + x1].to_vec()).collect() };
+    // buttons side by side with nothing between them, cut out together, are each a piece of their own
+    let pieces = apart(&img);
+    if pieces.len() > 1 && pieces.iter().all(|&a| shapes(&cut(&img, a), CLEAR).iter().any(is_solid)) {
+        for a in pieces {
+            sheet_parts(entry, name, cut(&img, a), (at.0 + a.0, at.1 + a.1), parts);
+        }
+        return;
+    }
+    // nor is a row with a button in it one label, as a save screen's tabs and buttons side by side
+    let buttons = |s: &Block| {
+        let row = cut(&img, (s.x0, s.y0, s.x1, s.y1));
+        apart(&row).into_iter().any(|a| shapes(&cut(&row, a), CLEAR).iter().any(is_solid))
+    };
+    let inside: Vec<Block> = shapes(&img, CLEAR).into_iter().filter(|s| (s.x1 - s.x0, s.y1 - s.y0) != (img.w, img.h) && (is_solid(s) || s.y1 - s.y0 > TALLEST_LABEL || buttons(s))).collect();
     let piece = format!("{name}@{},{}", at.0, at.1);
     // a sheet's options sit under their setting, not after it on the row, so none takes a hint from its row
     if let Some(mut p) = scan(entry, None, (at.0 as i32, at.1 as i32), piece, img.clone()) {
-        // a taller block is read as a piece of its own below, so it isn't split into lines here too
-        p.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL);
+        // a block read as pieces of its own below isn't read whole here, nor split into lines
+        p.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL && !inside.iter().any(|s| (s.x0, s.y0, s.x1, s.y1) == (b.x0, b.y0, b.x1, b.y1)));
         // labels on nothing can stand one above another; inside a button, two lines are one label
         p.blocks = if p.bg == CLEAR { split_lines(std::mem::take(&mut p.blocks)) } else { join_lines(std::mem::take(&mut p.blocks)) };
         parts.extend((!p.blocks.is_empty()).then_some(p));
     }
-    let cut = |img: &Image, (x0, y0, x1, y1): Area| Image { w: x1 - x0, h: y1 - y0, px: (y0..y1).flat_map(|y| img.px[y * img.w + x0..y * img.w + x1].to_vec()).collect() };
     for s in inside {
         let crop = cut(&img, (s.x0, s.y0, s.x1, s.y1));
         // buttons side by side stand closer than words do, so a solid shape parts where nothing is between
@@ -2167,6 +2328,25 @@ mod tests {
     }
 
     #[test]
+    fn a_row_of_buttons_is_not_one_label_and_each_button_is_read_on_its_face() {
+        let (w, h) = (300, 100);
+        let mut sheet = Image { w, h, px: vec![CLEAR; w * h] };
+        // a label on nothing, then two buttons with a narrow gap: all closer than words stand
+        for (y, x) in (44..56).flat_map(|y| (12..67).filter(|x| x % 3 == 0).map(move |x| (y, x))) {
+            sheet.px[y * w + x] = 0x00ff_ffff;
+        }
+        let b = button(35);
+        for left in [78, 184] {
+            for y in 0..b.h {
+                sheet.px[(30 + y) * w + left..][..b.w].copy_from_slice(&b.px[y * b.w..][..b.w]);
+            }
+        }
+        let mut parts = Vec::new();
+        sheet_parts(0, "s", sheet, (0, 0), &mut parts);
+        assert_eq!(parts.iter().map(|p| (p.at, p.bg, p.blocks.len())).collect::<Vec<_>>(), [((12, 30), CLEAR, 1), ((78, 30), 0, 1), ((184, 30), 0, 1)]);
+    }
+
+    #[test]
     fn two_lines_inside_a_button_are_one_label_and_a_label_beside_stays_apart() {
         let block = |x0: usize, y0: usize| Block { x0, y0, x1: x0 + 20, y1: y0 + 10, mask: vec![true; 200], group: 0 };
         let joined = join_lines(vec![block(10, 22), block(12, 10), block(60, 10)]);
@@ -2233,6 +2413,43 @@ mod tests {
             lone.px[y * 20 + x] = ink;
         }
         assert!(scan(0, None, (0, 0), "box".into(), lone).is_none(), "an empty checkbox holds no text");
+    }
+
+    #[test]
+    fn an_icon_drawn_solid_before_a_label_stays_out_of_it() {
+        let (w, h, ink) = (120, 40, 0x0048_260f);
+        let mut img = Image { w, h, px: vec![CLEAR; w * h] };
+        // ■ in the text's own colour, then "text" of thin solid strokes, which are letters' strokes
+        (10..22).flat_map(|y| (10..22).map(move |x| (y, x))).for_each(|(y, x)| img.px[y * w + x] = ink);
+        for (y, x) in (10..24).flat_map(|y| (30..80).filter(|x| x % 3 == 0).map(move |x| (y, x))) {
+            img.px[y * w + x] = ink;
+        }
+        let mut part = scan(0, None, (0, 0), "s".into(), img).unwrap();
+        strip_marks(std::slice::from_mut(&mut part));
+        assert_eq!(part.blocks.iter().map(|b| b.x0).collect::<Vec<_>>(), [30], "the text starts after the icon, with all its strokes");
+    }
+
+    #[test]
+    fn a_checkbox_inside_a_row_starts_another_label() {
+        let (w, h, ink) = (170, 100, 0x0048_260f);
+        let mut img = Image { w, h, px: vec![CLEAR; w * h] };
+        for top in [10, 40, 70] {
+            for left in [10, 87] {
+                for (y, x) in (top..top + 12).flat_map(|y| (left..left + 12).map(move |x| (y, x))) {
+                    if !(left + 2..left + 10).contains(&x) || !(top + 2..top + 10).contains(&y) {
+                        img.px[y * w + x] = ink;
+                    }
+                }
+                for (y, x) in (top..top + 12).flat_map(|y| (left + 18..left + 70).filter(|x| x % 3 == 0).map(move |x| (y, x))) {
+                    img.px[y * w + x] = ink;
+                }
+            }
+        }
+        let mut part = scan(0, None, (0, 0), "s".into(), img).unwrap();
+        assert_eq!(part.blocks.len(), 3, "a row is one block until its boxes are found");
+        strip_marks(std::slice::from_mut(&mut part));
+        let spans: Vec<(usize, usize)> = part.blocks.iter().map(|b| (b.x0, b.x1)).collect();
+        assert_eq!(spans, [(30, 79), (105, 157), (30, 79), (105, 157), (30, 79), (105, 157)], "two labels a row, the boxes left out");
     }
 
     /// A black button in a grey frame with a white bar of "text".
@@ -2416,6 +2633,31 @@ mod tests {
         std::fs::remove_dir_all(&game).unwrap();
     }
 
+
+    #[test]
+    fn different_labels_on_one_picture_get_english_of_their_own() {
+        let game = std::env::temp_dir().join(format!("vntl_apart_{}", std::process::id()));
+        // a reply for each run: a question for the look-alikes would use one up and fail the test
+        let (chat, cancel) = (Scripted::new(&["1: Pause\n2: Yes", "1: Pause\n2: Stop"]), AtomicBool::new(false));
+        let mut job = Job::new(&game, &chat, &|_| {}, &cancel).unwrap();
+        let block = |x0: usize, mask: [bool; 4], group| Block { x0, y0: 0, x1: x0 + 4, y1: 1, mask: mask.to_vec(), group };
+        let (a, b, c) = ([true, false, true, false], [false, true, false, true], [true, true, false, false]);
+        let blocks = vec![block(0, a, 0), block(5, b, 1), block(10, c, 2), block(15, c, 3)];
+        let part = Part { entry: 0, sprite: None, at: (0, 0), name: "p".into(), img: Image { w: 20, h: 1, px: vec![CLEAR; 20] }, bg: CLEAR, blocks };
+        // はい and はぃ are one button's states, drawn alike: the same English is right for them
+        let groups: Vec<Group> = ["一時停止", "停止", "はい", "はぃ"].iter().map(|r| Group { key: String::new(), first: (0, 0), second: None, reads: vec![r.to_string()] }).collect();
+        for (r, en) in [("一時停止", "Pause"), ("停止", "Pause"), ("はい", "Yes"), ("はぃ", "Yes")] {
+            job.labels.insert(r.into(), en.into());
+        }
+        let todo: Vec<(String, usize, String)> = groups.iter().map(|g| (g.reads[0].clone(), 9, String::new())).collect();
+        let english = |job: &Job| -> Vec<String> { groups.iter().map(|g| job.labels[&g.reads[0]].clone()).collect() };
+        job.tell_apart(std::slice::from_ref(&part), &groups, &todo).unwrap();
+        assert_eq!(english(&job), ["Pause", "Pause", "Yes", "Yes"], "an answer another label already has is no answer");
+        job.tell_apart(std::slice::from_ref(&part), &groups, &todo).unwrap();
+        assert_eq!(english(&job), ["Pause", "Stop", "Yes", "Yes"]);
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
     /// A tall picture with a plain or an empty backdrop and one small label on it.
     fn tall_picture(backdrop: u32) -> Image {
         let (w, h) = (300, 300);
@@ -2554,6 +2796,22 @@ mod tests {
         let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
         let img = repaint(&part, &[Some(&"Hi".to_string())], &font).unwrap();
         assert!(img.px.contains(&0x00ff_ffff), "the outline outnumbers the fill, but the fill is the text's colour");
+    }
+
+    #[test]
+    fn thin_dark_text_in_a_thick_light_outline_stays_dark() {
+        let (w, h, ink) = (100, 30, 0x0040_2010);
+        let mut px = vec![CLEAR; w * h];
+        for y in 6..22 {
+            for x in 10..40 {
+                px[y * w + x] = if (13..15).contains(&y) && (12..38).contains(&x) { ink } else { 0x00ff_ffff };
+            }
+        }
+        let part = scan(0, None, (0, 0), "t".into(), Image { w, h, px }).unwrap();
+        let bytes = FONTS.iter().find_map(|p| std::fs::read(p).ok()).unwrap();
+        let font = Font::from_bytes(bytes, FontSettings::default()).unwrap();
+        let img = repaint(&part, &[Some(&"Hi".to_string())], &font).unwrap();
+        assert!(img.px.contains(&ink), "a tenth of the ink is the letters' own colour, and the light edge is the outline");
     }
 
     #[test]
