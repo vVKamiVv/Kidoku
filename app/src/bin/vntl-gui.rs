@@ -159,7 +159,7 @@ fn offers(engine: &str) -> EngineOptions {
         reference: renpy,
         scene: renpy || rpgmaker,
         scene_is_file: rpgmaker,
-        images: renpy || liarsoft || rpgmaker || engine == "artemis" || engine == "bgi",
+        images: renpy || liarsoft || rpgmaker || ["artemis", "bgi", "siglusengine"].contains(&engine),
         art: renpy || unity,
         retranslate: unity,
         redump: renpy,

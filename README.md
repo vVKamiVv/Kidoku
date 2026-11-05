@@ -65,10 +65,10 @@
 | **Liar-soft** | Script and menus | Yes | Speakers come from the name plates, read by the text reader or an image model, and the plates are repainted in English. The engine patch needs a build with the same byte pattern |
 | **RPG Maker MV/MZ** | Messages, choices, database, menu terms and plugin text | Short images, encrypted ones too | Other plugin settings stay Japanese until they're listed |
 | **Malie** | Messages and names | Not yet | The key is found in the game's program |
-| **SiglusEngine** | Messages, names, choices, the right-click menu and dialogs | Not yet | The key is worked out from the game's own scenes |
+| **SiglusEngine** | Messages, names, choices, the right-click menu and dialogs | System pictures (`g00`) | The key is worked out from the game's own scenes |
 | **QLIE** | Story text, names and choices | Not yet | FilePackVer3.1 packs only |
 | **Wolf RPG Editor** | Messages, choices, picture text and databases | Not yet | Old archives only |
-| **RealLive** | Messages, names and choices | Not yet | Compiler 10002 scripts only |
+| **RealLive** | Messages, names, choices, the right-click menu and dialogs | Its window buttons are already English | Compiler 10002 scripts only |
 | **CatSystem2** | Messages, names and choices | Not yet | The passphrase is read from the game's program |
 | **Majiro** | Messages, names and choices | Not yet | ArcV3 archives only |
 | **YU-RIS** | Messages, names and choices | Not yet | The engine wraps lines itself, and may cut words |

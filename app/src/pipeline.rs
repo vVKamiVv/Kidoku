@@ -1227,6 +1227,25 @@ fn translate_bgi(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &
     Ok(())
 }
 
+fn write_siglus(game: &Path, cache: &Cache) -> R<String> {
+    let listed = listed_names(game);
+    let n = siglus::install(game, &|k| cache.lines.get(k).cloned(), &|name| english_name(&listed, cache, name))?;
+    Ok(format!("Wrote {n} translated strings into Scene.pck (read back OK; the original is kept as Scene.pck.vntl-orig)."))
+}
+
+/// The story, then the system pictures, which are files of their own.
+fn translate_siglus(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<()> {
+    let lines = siglus::Game::open(&o.game)?.lines();
+    translate_script(o, chat, report, cancel, "SiglusEngine", &lines, &NO_MARKUP, &|cache| write_siglus(&o.game, cache))?;
+    if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
+        let cache: Cache = load_json(&cache_file(&o.game, &o.lang))?;
+        let listed = listed_names(&o.game);
+        let english = |jp: &str| english_name(&listed, &cache, jp);
+        report(Event::Log(crate::menus::translate_siglus_menus(&o.game, &Checked { vision: vision.as_ref(), story: chat }, &english, report, cancel)?));
+    }
+    Ok(())
+}
+
 type Run = fn(&Options, &dyn Chat, &dyn Fn(Event), &AtomicBool) -> R<()>;
 
 /// An engine whose compiled script the app reads itself, by the name `detect` gives it.
@@ -1273,7 +1292,7 @@ static SCRIPT_ENGINES: [ScriptEngine; 16] = [
     engine_row!("wolf-rpg", wolf, "Wolf RPG", &wolf::MARKUP, "strings into Data.wolf (read back OK; the original is kept as Data.wolf.vntl-orig).", named),
     engine_row!("kirikiri", kirikiri, "KiriKiri", &kirikiri::MARKUP, "texts into the game's archives (read back OK; the originals are kept as *.vntl-orig)."),
     engine_row!("nscripter", nscripter, "NScripter", &nscripter::MARKUP, "strings into nscript.dat (read back OK; the original is kept as nscript.dat.vntl-orig).", named),
-    engine_row!("siglusengine", siglus, "SiglusEngine", &NO_MARKUP, "strings into Scene.pck (read back OK; the original is kept as Scene.pck.vntl-orig).", named),
+    ScriptEngine { id: "siglusengine", translate: translate_siglus, write: write_siglus, lines: |game| Ok(siglus::Game::open(game)?.lines().len()) },
     engine_row!("qlie", qlie, "QLIE", &NO_MARKUP, "strings into the game's script pack (read back OK; the originals are kept as *.vntl-orig).", named),
     engine_row!("reallive", reallive, "RealLive", &NO_MARKUP, "strings into SEEN.TXT (read back OK; the original is kept as SEEN.TXT.vntl-orig).", named),
     engine_row!("catsystem2", catsystem, "CatSystem2", &NO_MARKUP, "strings into scene.int (read back OK; the original is kept as scene.int.vntl-orig).", named),

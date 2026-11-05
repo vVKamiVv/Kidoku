@@ -17,6 +17,7 @@ pub mod code;
 pub mod fit;
 pub mod fonts;
 pub mod fvp;
+pub mod g00;
 pub mod inpaint;
 pub mod kirikiri;
 pub mod lcf;

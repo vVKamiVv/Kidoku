@@ -2,6 +2,7 @@
 //! mask. Text sits inside the code, so a new line moves everything after it: the code is walked whole,
 //! noting every jump, and rebuilt with the jumps put right.
 
+use crate::code::{shown_strings, with_english, GAMEEXE};
 use crate::pipeline::Line;
 use crate::text::{ascii_punctuation, sjis, wrap_words, JA};
 use crate::{original, replace_file, R};
@@ -622,6 +623,20 @@ pub struct Game {
     archive: Vec<u8>,
     scenes: Vec<Scene>,
     width: usize,
+    /// Gameexe.ini, and where the words a player reads are in it.
+    settings: String,
+    shown: Vec<(usize, usize)>,
+}
+
+// ---------- settings ----------
+
+/// Settings a player reads: the right-click menu and the save, load and quit dialogs. Others name
+/// things the scripts look up, as `#NAMAE`'s names and `#KOEONOFF`'s voices.
+static SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^#(?:SYSCOM\.|SAVE_NODATA|SYSTEM_SAVELOADMESSAGE_STR|SAVEMESSAGE_|LOADMESSAGE_|DLGSAVEMESSAGE_|DLGLOADMESSAGE_|GAME_END_MESS_STR)").unwrap());
+static NOT_SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new("$^").unwrap());
+
+fn config_key(start: usize) -> String {
+    format!("settings:{start}")
 }
 
 fn toc(b: &[u8], i: usize) -> R<(usize, usize)> {
@@ -649,12 +664,15 @@ impl Game {
                 scenes.push(Scene::read(i, b).map_err(|e| format!("scene {i}: {e}"))?);
             }
         }
-        Ok(Game { archive, scenes, width: window(game) })
+        let settings = original(&game.join(CONFIG)).map(|b| SHIFT_JIS.decode_without_bom_handling(&b).0.into_owned()).unwrap_or_default();
+        let shown = shown_strings(std::slice::from_ref(&settings), &GAMEEXE, &SHOWN, &NOT_SHOWN).into_iter().map(|s| (s.1, s.2)).collect();
+        Ok(Game { archive, scenes, width: window(game), settings, shown })
     }
 
     pub fn lines(&self) -> Vec<Line> {
         let mut out = Vec::new();
         self.scenes.iter().for_each(|s| s.lines(&mut out));
+        out.extend(self.shown.iter().map(|&(start, end)| (config_key(start), None, self.settings[start..end].to_string())));
         out
     }
 }
@@ -680,7 +698,15 @@ pub fn install(game: &Path, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn
         Scene::read(s.number, &out[at..at + size]).map_err(|e| format!("scene {} didn't read back: {e}", s.number))?;
     }
     replace_file(&game.join(ARCHIVE), &out)?;
-    Ok(done)
+    let (settings, words) = with_english(&g.settings, &g.shown, &|start, _| line(&config_key(start)).map(|t| ascii_punctuation(&t)));
+    if words > 0 {
+        let (bytes, _, unmapped) = SHIFT_JIS.encode(&settings);
+        if unmapped || SHIFT_JIS.decode_without_bom_handling(&bytes).0 != settings {
+            return Err("Gameexe.ini didn't read back as written".into());
+        }
+        replace_file(&game.join(CONFIG), &bytes)?;
+    }
+    Ok(done + words)
 }
 
 #[cfg(test)]
@@ -746,6 +772,22 @@ mod tests {
         }
         fs::write(dir.join(ARCHIVE), out).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_menu_and_dialogs_in_the_settings_change_and_names_stay() {
+        let dir = game(&[(20, scene(&sjis("ASCII only")))]);
+        let ini = "#SYSCOM.000=U:\"セーブ\"\n#NAMAE.000=\"太郎\"\n#SAVEMESSAGE_MESS_STR=\"セーブしますか？\"\n";
+        fs::write(dir.join(CONFIG), SHIFT_JIS.encode(ini).0).unwrap();
+        let lines = Game::open(&dir).unwrap().lines();
+        let texts: Vec<&str> = lines.iter().map(|l| l.2.as_str()).collect();
+        assert_eq!(texts, ["セーブ", "セーブしますか？"]);
+        let english: HashMap<String, &str> = lines.iter().map(|l| l.0.clone()).zip(["Save", "Save the \"game\"?"]).collect();
+        assert_eq!(install(&dir, &|k| english.get(k).map(|s| s.to_string()), &|_| None).unwrap(), 2);
+        let written = SHIFT_JIS.decode(&fs::read(dir.join(CONFIG)).unwrap()).0.into_owned();
+        assert_eq!(written, "#SYSCOM.000=U:\"Save\"\n#NAMAE.000=\"太郎\"\n#SAVEMESSAGE_MESS_STR=\"Save the 'game'?\"\n");
+        assert_eq!(Game::open(&dir).unwrap().lines().len(), 2, "read from the kept original");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

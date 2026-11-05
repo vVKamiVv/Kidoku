@@ -9,7 +9,7 @@ use crate::ocr::{Area, Reader};
 use crate::pipeline::Event;
 use crate::reference::{archive_files, read_game_file};
 use crate::renpy::{load_json, save_json, tl_dir};
-use crate::{artemis, bgi, rpgmaker};
+use crate::{artemis, bgi, g00, rpgmaker, siglus};
 use crate::text::JA;
 use crate::{files_under, original, replace_file, R};
 use flate2::{write::ZlibEncoder, Compression, Crc};
@@ -24,6 +24,9 @@ use std::sync::LazyLock;
 /// Loanwords menus are full of, for the image model to read look-alike katakana by.
 // short words it reads anyway are left out: given one, it answers it for an arrow or a dot
 const MENU_WORDS: [&str; 13] = ["フルスクリーン", "キャンセル", "スキップ", "オート", "テキスト", "メッセージ", "バックログ", "システム", "クイック", "カーソル", "マウス", "エフェクト", "ムービー"];
+/// Loanwords both the image and the story's model take for another English word, with what a menu
+/// means by them: ノーウェイト came out "No Weight" from each.
+const SOUND_ALIKES: [(&str, &str); 1] = [("ウェイト", "ウェイト is wait, a pause, not weight")];
 static READ_PROMPT: LazyLock<String> = LazyLock::new(|| format!(
     "This image is one label from the menus of a Japanese visual novel: its settings, save, load or title screens. \
      Write out exactly the Japanese text it shows, nothing else, and leave out an English line printed under it as a subtitle. \
@@ -191,10 +194,12 @@ fn shapes(img: &Image, bg: u32) -> Vec<Block> {
             y += 1;
         }
         let cols: Vec<usize> = (0..img.w).filter(|x| (top..y).any(|r| ink(*x, r))).collect();
+        // big lettering is spaced wider, as a title's
+        let gap = 18.max((y - top) / 2);
         let mut start = cols[0];
         for (i, x) in cols.iter().enumerate() {
             let next = cols.get(i + 1);
-            if next.is_none_or(|n| n - x > 18) {
+            if next.is_none_or(|n| n - x > gap) {
                 if x + 1 - start >= 14 && y - top >= 8 {
                     let mask: Vec<bool> = (top..y).flat_map(|r| (start..=*x).map(move |c| (c, r))).map(|(c, r)| ink(c, r)).collect();
                     out.push(Block { x0: start, y0: top, x1: x + 1, y1: y, mask, group: 0 });
@@ -428,7 +433,11 @@ fn clean(text: String) -> String {
     // nor hold a checkbox: that's the box beside it, read as a square or a line's corner
     let boxes = |c: char| ['□', '■', '☐', '☑', '☒', '◻', '◼'].contains(&c) || ('\u{2500}'..='\u{257f}').contains(&c);
     // or the dots either side of a button's word
-    text.chars().filter(|c| !boxes(*c)).collect::<String>().trim_matches('・').trim_end_matches(['？', '?', '！', '!', '。', '|']).to_string()
+    let text = text.chars().filter(|c| !boxes(*c)).collect::<String>().trim_matches('・').trim_end_matches(['？', '?', '！', '!', '。', '|']).to_string();
+    // a label's own slash, as セーブ／クイックセーブ, mustn't pass for the one between two readings of it;
+    // one at the end is a misread ノ, which look_alikes puts right
+    let (body, end) = text.strip_suffix('/').map_or((text.as_str(), ""), |b| (b, "/"));
+    body.split('/').map(str::trim).collect::<Vec<_>>().join("／") + end
 }
 
 /// Which of two readings of a label the image shows, asked with the picture again: told what to
@@ -770,8 +779,10 @@ fn spelled_names(reading: &str, names: &dyn Fn(&str) -> Option<String>) -> Optio
 /// What of a model's reply may be painted: its first line, if it has English. A blank would erase
 /// the button's text and draw nothing, and the Latin font would draw Japanese as boxes.
 fn paintable(reply: &str, reading: &str) -> Option<String> {
-    // " / " is the model's second guess
-    let first = reply.split("\\n").next()?.split(" / ").next()?.trim();
+    // " / " is the model's second guess, unless the label has a slash of its own, as セーブ／クイックセーブ
+    let first = reply.split("\\n").next()?;
+    let own = reading.contains('／') || reading.replace(BOTH, "").contains('/');
+    let first = if own { first.trim() } else { first.split(" / ").next()?.trim() };
     // "Yes: Confirm" is the label and then what it does
     let first = if reading.contains([':', '：']) { first } else { first.split(": ").next()?.trim() };
     // brackets the label doesn't have are the model talking about it, unless short and plain, as
@@ -814,14 +825,14 @@ fn unvoiced(reading: &str) -> String {
 }
 
 /// Readings a letter away by a pair an image model mixes up in menu lettering: the round mark and the
-/// two strokes, as パ and バ, and ノ for a slash after Japanese.
+/// two strokes, as パ and バ, and ノ for a slash ending Japanese (between words, a slash is the label's).
 fn look_alikes(reading: &str) -> Vec<String> {
     const PAIRS: [(char, char); 10] = [('バ', 'パ'), ('ビ', 'ピ'), ('ブ', 'プ'), ('ベ', 'ペ'), ('ボ', 'ポ'), ('ば', 'ぱ'), ('び', 'ぴ'), ('ぶ', 'ぷ'), ('べ', 'ぺ'), ('ぼ', 'ぽ')];
     let chars: Vec<char> = reading.chars().collect();
     (0..chars.len()).filter_map(|i| {
         let after_japanese = i > 0 && JA.is_match(&chars[i - 1].to_string());
         let other = match chars[i] {
-            '/' if after_japanese => 'ノ',
+            '/' | '／' if after_japanese && i + 1 == chars.len() => 'ノ',
             c => PAIRS.iter().find_map(|&(a, b)| if c == a { Some(b) } else if c == b { Some(a) } else { None })?,
         };
         let mut v = chars.clone();
@@ -1080,9 +1091,12 @@ impl<'a> Job<'a> {
         read_block(self.vision, &write_png(&block_image(part, b, scale))?)
     }
 
-    /// Whether a label's last line is English in smaller letters than its first, as "play" under 再生.
+    /// Whether a label's last line is English, as "play" under 再生, or a line of English stands just
+    /// under it, as SKIP under スキップ.
     fn english_under(&self, part: &Part, b: &Block) -> R<bool> {
         let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+        // a button: an icon, its Japanese and its English at most
+        let button = part.blocks.len() <= 3 && part.img.h <= BUTTON_HEIGHT;
         // any ink shown counts, as a greyed-out state's faint letters; a row with a pixel or two is
         // a gap, as an "l" can reach up to touch the line above
         let shown = |x: usize, y: usize| {
@@ -1100,16 +1114,25 @@ impl<'a> Job<'a> {
         if lines.len() == 1 {
             // an icon beside both lines joins them, as ▶ beside 再生 over "play": the label is past it
             let tall = lines[0].1 - lines[0].0;
-            return match first_mark(b).filter(|m| m.3 * 4 >= tall * 3) {
-                Some((next, ..)) => self.english_under(part, &columns_of(b, next, w)),
-                None => Ok(false),
-            };
+            if let Some((next, ..)) = first_mark(b).filter(|m| m.3 * 4 >= tall * 3) {
+                return self.english_under(part, &columns_of(b, next, w));
+            }
+            // a block of its own right under it is asked about together with it, on a button: on a
+            // sheet, what's under a heading is its options
+            let Some(o) = part.blocks.iter().filter(|_| button).find(|o| o.y0 >= b.y1 && o.y0 - b.y1 <= tall && o.x0 < b.x1 && b.x0 < o.x1) else { return Ok(false) };
+            let (x0, x1) = (b.x0.min(o.x0), b.x1.max(o.x1));
+            let mask = (b.y0..o.y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| {
+                let p = part.img.px[y * part.img.w + x];
+                if part.bg == CLEAR { p >> 24 < 250 } else { differs(p, part.bg) }
+            }).collect();
+            return self.english_under(part, &Block { x0, y0: b.y0, x1, y1: o.y1, mask, group: b.group });
         }
         if lines.is_empty() {
             return Ok(false);
         }
+        // on a sheet, only English smaller than the label is its own: a bigger line is another label
         let ((t0, t1), (u0, u1)) = (lines[0], lines[lines.len() - 1]);
-        if (u1 - u0) * 4 > (t1 - t0) * 3 {
+        if !button && (u1 - u0) * 4 > (t1 - t0) * 3 {
             return Ok(false);
         }
         // the line with the tops and tails of its letters, from the line above it to the bottom
@@ -1578,6 +1601,11 @@ impl<'a> Job<'a> {
             });
             row.min_by_key(|(left, _)| *left).map_or(String::new(), |(_, r)| format!("an option of the setting '{r}'; "))
         };
+        // and a loanword the models hear as another English word
+        let hint = |g: &Group| -> String {
+            let notes: String = SOUND_ALIKES.iter().filter(|(w, _)| key(g).contains(w)).map(|(_, n)| format!("{n}; ")).collect();
+            notes + &hint(g)
+        };
         // a character's name, or names together, is spelled as the story has it
         for g in groups.iter().filter(|g| g.reads.len() == 1) {
             if let Some(en) = spelled_names(&g.reads[0], self.names) {
@@ -1960,7 +1988,9 @@ fn label_part(entry: usize, name: String, img: Image) -> Option<Part> {
     let big = img.h > BUTTON_HEIGHT;
     let mut part = scan(entry, None, (0, 0), name, img)?;
     if big {
-        part.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL);
+        // a row across nearly the whole picture is a pattern, as a grid of dashes, not a label
+        let w = part.img.w;
+        part.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL && (b.x1 - b.x0) * 10 < w * 9);
     }
     (!part.blocks.is_empty()).then_some(part)
 }
@@ -2135,6 +2165,43 @@ fn first_mark(b: &Block) -> Option<(usize, Vec<bool>, usize, usize)> {
     Some((next, (top..bottom).flat_map(|y| (0..gap).map(move |x| b.mask[y * w + x])).collect(), gap, bottom - top))
 }
 
+/// Whether the ring 2 pixels wide around a block is, nearly all of it, the backdrop.
+fn on_backdrop(img: &Image, bg: u32, b: &Block) -> bool {
+    let (x0, y0, x1, y1) = (b.x0.saturating_sub(2), b.y0.saturating_sub(2), (b.x1 + 2).min(img.w), (b.y1 + 2).min(img.h));
+    let ring: Vec<u32> = (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| x < b.x0 || x >= b.x1 || y < b.y0 || y >= b.y1).map(|(x, y)| img.px[y * img.w + x]).collect();
+    ring.iter().filter(|p| !differs(**p, bg)).count() * 10 >= ring.len() * 8
+}
+
+/// How many separate shapes ink of width `w` makes, touching corners counting as one.
+fn pieces(mask: &[bool], w: usize) -> usize {
+    let h = mask.len() / w.max(1);
+    let mut seen = vec![false; mask.len()];
+    let mut n = 0;
+    for start in 0..mask.len() {
+        if !mask[start] || seen[start] {
+            continue;
+        }
+        n += 1;
+        seen[start] = true;
+        let mut todo = vec![start];
+        while let Some(i) = todo.pop() {
+            let (x, y) = ((i % w) as isize, (i / w) as isize);
+            for (dx, dy) in (-1..=1).flat_map(|dy| (-1..=1).map(move |dx| (dx, dy))) {
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                if mask[j] && !seen[j] {
+                    seen[j] = true;
+                    todo.push(j);
+                }
+            }
+        }
+    }
+    n
+}
+
 /// Columns `from..to` of a block.
 fn columns_of(b: &Block, from: usize, to: usize) -> Block {
     let w = b.x1 - b.x0;
@@ -2212,7 +2279,7 @@ fn split_at_boxes(b: Block, img: &Image, marks: &[&(usize, Vec<bool>, usize, usi
 /// Marks before a label's text stay as they are, and its block starts after them: anything in a
 /// colour the text doesn't use (a star, a dotted line), and a hollow square that three or more
 /// labels start with (a checkbox), counted over all `parts`, the pieces of one picture.
-fn strip_marks(parts: &mut [Part]) {
+fn strip_marks(parts: &mut [Part], states: bool) {
     for part in parts.iter_mut() {
         let img = &part.img;
         let colours = |b: &Block, cols: std::ops::Range<usize>| {
@@ -2236,7 +2303,9 @@ fn strip_marks(parts: &mut [Part]) {
                 let dot = h * 3 <= rest_h && w * 3 <= rest_h;
                 // and an icon drawn solid, as ■, is no letter: a solid stroke is thin, as リ's first, or flat, as ー
                 let solid = h >= 6 && h * 2 >= w && w * 2 >= h && mask.iter().filter(|m| **m).count() * 10 >= mask.len() * 9;
-                if bw - next < 14 || (!dot && !solid && rest.get(&c).copied().unwrap_or(0) * 20 >= total) {
+                // a letter in a colour of its own, as a title's first kanji, is strokes apart; a star or ♪ isn't
+                let letter = pieces(&mask, w) >= 3;
+                if bw - next < 14 || (!dot && !solid && (letter || rest.get(&c).copied().unwrap_or(0) * 20 >= total)) {
                     break;
                 }
                 cut_block(b, next);
@@ -2256,7 +2325,9 @@ fn strip_marks(parts: &mut [Part]) {
                 let bw = b.x1 - b.x0;
                 let rest = (0..b.y1 - b.y0).filter(|&y| (*next..bw).any(|x| b.mask[y * bw + x])).count();
                 // a box taller than the text beside it is no letter
-                if hollow(mask, *w, *h) && (alike(&all, mask, *w, *h) >= 3 || h * 10 >= rest * 13) {
+                // counted over a button's states, the same letter repeats: a box then has to start the picture
+                let counted = alike(&all, mask, *w, *h) >= 3 && (!states || b.x0 <= 4);
+                if hollow(mask, *w, *h) && (counted || h * 10 >= rest * 13) {
                     cuts[p][i] = Some(*next);
                 }
             }
@@ -2406,28 +2477,114 @@ pub fn translate_bgi_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str
     job.words = text.menu_words().iter().map(|w| w.chars().collect()).collect();
     job.people = text.speakers().iter().map(|w| w.chars().collect()).collect();
     let files = bgi::interface_pictures(game)?;
+    let pictures = files.iter().map(|(name, b)| bgi::picture(b).map(|img| (name.clone(), img)).ok_or(format!("{name}: not a picture"))).collect::<R<Vec<_>>>()?;
+    let sheets = repaint_sheets(&mut job, "sysgrp", pictures)?;
+    let mut painted = Vec::new();
+    for (entry, sheet) in &sheets {
+        let (name, stored) = &files[*entry];
+        let bytes = bgi::bitmap(stored, sheet);
+        if bgi::picture(&bytes).as_ref() != Some(sheet) {
+            return Err(format!("{name}: the repainted picture did not read back correctly"));
+        }
+        painted.push((name.clone(), bytes));
+    }
+    artemis::keep_painted(game, &painted)?;
+    Ok(format!("Repainted {} of {} menu pictures. To correct a label, edit vntl_work/image_labels.txt and run again.", painted.len(), files.len()))
+}
+
+/// The same for a SiglusEngine game: its system pictures are files, each cut of one (as a button's
+/// states) a picture of its own, rewritten in place.
+pub fn translate_siglus_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str) -> Option<String>, report: &dyn Fn(Event), cancel: &AtomicBool) -> R<String> {
+    let mut job = Job::new(game, vision, report, cancel)?;
+    job.names = english;
+    let files = siglus::interface_pictures(game)?;
+    let (mut pictures, mut whose) = (Vec::new(), Vec::new());
+    for (f, (path, b)) in files.iter().enumerate() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        for (c, img) in g00::cuts(b).map_err(|e| format!("{name}: {e}"))?.into_iter().enumerate() {
+            pictures.push((format!("{name}/{c}"), img));
+            whose.push((f, c));
+        }
+    }
+    let sheets = repaint_sheets(&mut job, "g00", pictures)?;
+    let mut done = 0;
+    for (f, (path, b)) in files.iter().enumerate() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let mut cuts = g00::cuts(b)?;
+        let new: Vec<(usize, &Image)> = whose.iter().enumerate().filter(|w| w.1 .0 == f).filter_map(|(i, w)| Some((w.1, sheets.get(&i)?))).collect();
+        new.iter().for_each(|&(c, img)| cuts[c] = img.clone());
+        // nothing shows what colour a fully clear pixel has, and only drawn rows are stored
+        cuts.iter_mut().flat_map(|c| c.px.iter_mut()).filter(|p| **p >> 24 == 255).for_each(|p| *p = CLEAR);
+        let bytes = if new.is_empty() { b.clone() } else { g00::with_cuts(b, &cuts).map_err(|e| format!("{name}: {e}"))? };
+        if !new.is_empty() && g00::cuts(&bytes)? != cuts {
+            return Err(format!("{name}: the repainted picture did not read back correctly"));
+        }
+        // one repainted on an earlier run, and not now, goes back to the game's own
+        if !new.is_empty() || crate::backup(path).exists() {
+            replace_file(path, &bytes)?;
+        }
+        done += !new.is_empty() as usize;
+    }
+    Ok(format!("Repainted {done} of {} system pictures. To correct a label, edit vntl_work/image_labels.txt and run again.", files.len()))
+}
+
+/// Reads, translates and repaints pictures, transparent sheets of labels and buttons or pictures with
+/// a backdrop alike. Returns each repainted picture whole, by its place in `pictures`.
+fn repaint_sheets(job: &mut Job, screen: &str, pictures: Vec<(String, Image)>) -> R<IndexMap<usize, Image>> {
+    // menu lettering, rounded and outlined, is misread by the text reader, and its readings of icons
+    // go unchecked; the image model first asks whether there's Japanese at all
+    job.vision_first = true;
     let (mut parts, mut own) = (Vec::new(), Vec::new());
-    for (i, (name, b)) in files.iter().enumerate() {
-        let img = bgi::picture(b).ok_or(format!("{name}: not a picture"))?;
+    // marks are told apart over a file's pictures together, as a checkbox in each state of one
+    // (name/cut): its name, where its parts start and how many pictures it has
+    let mut run: Option<(String, usize, usize)> = None;
+    let flush = |parts: &mut Vec<Part>, run: &mut Option<(String, usize, usize)>| {
+        if let Some((_, start, n)) = run.take() {
+            strip_marks(&mut parts[start..], n > 1);
+        }
+    };
+    // parts of pictures with a backdrop
+    let mut backed = Vec::new();
+    for (i, (name, img)) in pictures.into_iter().enumerate() {
+        let file = name.split('/').next().unwrap_or_default().to_string();
+        if run.as_ref().is_some_and(|r| r.0 != file) {
+            flush(&mut parts, &mut run);
+        }
         // a striped face is read as its commoner colour, and its stripes go back where a repaint wipes them
         let stripes = stripes(&img);
         let mut bare = img.clone();
         bare.px.iter_mut().for_each(|q| *q = stripes.iter().find(|s| s.1 == *q).map_or(*q, |s| s.0));
+        match run.as_mut() {
+            Some(r) => r.2 += 1,
+            None => run = Some((file, parts.len(), 1)),
+        }
         if flat_background(&bare) != Some(CLEAR) {
-            parts.extend(label_part(i, name.clone(), bare));
+            // lettering taller than a label is a designed button, as a big English word with its Japanese
+            // and an icon, which already says what it does: none of it is a label to repaint
+            if let Some(p) = label_part(i, name, bare).filter(|p| p.blocks.iter().all(|b| b.y1 - b.y0 <= TALLEST_LABEL)) {
+                backed.push(parts.len());
+                parts.push(p);
+            }
             own.push((img, Vec::new(), stripes));
             continue;
         }
         // text is read with the paper taken away, and the paper's pattern goes back under the English
         let papers = papers(&img);
         bare.px.iter_mut().filter(|q| papers.iter().any(|p| p.0 == **q)).for_each(|q| *q = CLEAR);
-        let start = parts.len();
-        sheet_parts(i, name, bare, (0, 0), &mut parts);
-        strip_marks(&mut parts[start..]);
+        sheet_parts(i, &name, bare, (0, 0), &mut parts);
         own.push((img, papers, stripes));
     }
-    job.vision_first = true;
-    let changed = job.screen("sysgrp", &mut parts)?;
+    flush(&mut parts, &mut run);
+    // and a label sits on the backdrop, marks taken off: a block with artwork around it is part of the art
+    for &i in &backed {
+        let (img, bg) = (&parts[i].img, parts[i].bg);
+        let kept: Vec<Block> = parts[i].blocks.iter().filter(|b| on_backdrop(img, bg, b)).cloned().collect();
+        parts[i].blocks = kept;
+    }
+    // and a sliver a mark was taken off is no label, as no block that narrow is found to begin with
+    parts.iter_mut().for_each(|p| p.blocks.retain(|b| b.x1 - b.x0 >= 14));
+    parts.retain(|p| !p.blocks.is_empty());
+    let changed = job.screen(screen, &mut parts)?;
     // each picture again, with only what a repaint changed, over the paper where there is some
     let mut new_px: IndexMap<usize, HashMap<usize, u32>> = IndexMap::new();
     for (i, img) in &changed {
@@ -2466,17 +2623,7 @@ pub fn translate_bgi_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str
         }
         sheets.insert(*entry, sheet);
     }
-    let mut painted = Vec::new();
-    for (entry, sheet) in &sheets {
-        let (name, stored) = &files[*entry];
-        let bytes = bgi::bitmap(stored, sheet);
-        if bgi::picture(&bytes).as_ref() != Some(sheet) {
-            return Err(format!("{name}: the repainted picture did not read back correctly"));
-        }
-        painted.push((name.clone(), bytes));
-    }
-    artemis::keep_painted(game, &painted)?;
-    Ok(format!("Repainted {} of {} menu pictures. To correct a label, edit vntl_work/image_labels.txt and run again.", painted.len(), files.len()))
+    Ok(sheets)
 }
 
 /// The same for an RPG Maker game: interface images are files, some encrypted, rewritten in place.
@@ -2529,6 +2676,15 @@ mod tests {
         head.extend(200u32.to_le_bytes());
         head.extend(30u32.to_le_bytes());
         (img.clone(), liar::write_wcg(&head, &img).unwrap())
+    }
+
+    #[test]
+    fn a_letter_in_pieces_is_told_from_a_mark() {
+        // a star: one shape; 小: a stroke and two dots apart
+        let star = [false, true, false, true, true, true, false, true, false];
+        let small = [true, false, true, false, false, false, false, true, false, true, false, true];
+        assert_eq!(pieces(&star, 3), 1);
+        assert_eq!(pieces(&small, 4), 3);
     }
 
     #[test]
@@ -2594,6 +2750,8 @@ mod tests {
     fn a_reply_that_talks_about_the_label_is_not_painted() {
         assert_eq!(paintable("Ri (likely a setting name, unclear)", "リ"), None);
         assert_eq!(paintable("Option / Settings", "設定").as_deref(), Some("Option"));
+        assert_eq!(paintable("Option / Settings", "設定 / 説定").as_deref(), Some("Option"), "two readings aren't a slash of the label's");
+        assert_eq!(paintable("Save / Quick Save", "セーブ／クイックセーブ").as_deref(), Some("Save / Quick Save"), "the label has a slash of its own");
         assert_eq!(paintable("Text Speed", "文字速度").as_deref(), Some("Text Speed"));
         assert_eq!(paintable("設定", "設定"), None);
         assert_eq!(paintable("Save (Overwrite)", "セーブ（上書き）").as_deref(), Some("Save (Overwrite)"), "the label has brackets of its own");
@@ -2831,7 +2989,7 @@ mod tests {
             }
         }
         let mut part = scan(0, None, (0, 0), "s".into(), img).unwrap();
-        strip_marks(std::slice::from_mut(&mut part));
+        strip_marks(std::slice::from_mut(&mut part), false);
         assert_eq!(part.blocks.iter().map(|b| b.x0).collect::<Vec<_>>(), [30, 30, 30], "each starts at its first stroke");
         let mut lone = Image { w: 20, h: 20, px: vec![CLEAR; 400] };
         for (y, x) in (4..16).flat_map(|y| (4..16).map(move |x| (y, x))).filter(|&(y, x)| !(6..14).contains(&x) || !(6..14).contains(&y)) {
@@ -2850,7 +3008,7 @@ mod tests {
             img.px[y * w + x] = ink;
         }
         let mut part = scan(0, None, (0, 0), "s".into(), img).unwrap();
-        strip_marks(std::slice::from_mut(&mut part));
+        strip_marks(std::slice::from_mut(&mut part), false);
         assert_eq!(part.blocks.iter().map(|b| b.x0).collect::<Vec<_>>(), [30], "the text starts after the icon, with all its strokes");
     }
 
@@ -2872,7 +3030,7 @@ mod tests {
         }
         let mut part = scan(0, None, (0, 0), "s".into(), img).unwrap();
         assert_eq!(part.blocks.len(), 3, "a row is one block until its boxes are found");
-        strip_marks(std::slice::from_mut(&mut part));
+        strip_marks(std::slice::from_mut(&mut part), false);
         let spans: Vec<(usize, usize)> = part.blocks.iter().map(|b| (b.x0, b.x1)).collect();
         assert_eq!(spans, [(30, 79), (105, 157), (30, 79), (105, 157), (30, 79), (105, 157)], "two labels a row, the boxes left out");
     }
@@ -3168,6 +3326,23 @@ mod tests {
     }
 
     #[test]
+    fn a_label_with_english_as_a_block_of_its_own_under_it_is_left_alone() {
+        let game = std::env::temp_dir().join(format!("vntl_english_below_{}", std::process::id()));
+        let (w, h) = (40, 40);
+        // a small line, and under it a bigger one apart, as SKIP under スキップ
+        let ink = |x: usize, y: usize| (2..10).contains(&y) && (10..30).contains(&x) || (12..36).contains(&y) && x < 36;
+        let img = Image { w, h, px: (0..h).flat_map(|y| (0..w).map(move |x| if ink(x, y) { 0 } else { CLEAR })).collect() };
+        let block = |x0: usize, y0: usize, x1: usize, y1: usize| Block { x0, y0, x1, y1, mask: (y0..y1).flat_map(|y| (x0..x1).map(move |x| ink(x, y))).collect(), group: 0 };
+        let (label, english) = (block(10, 2, 30, 10), block(0, 12, 36, 36));
+        let part = Part { entry: 0, sprite: None, at: (0, 0), name: "p".into(), img, bg: CLEAR, blocks: vec![label.clone(), english.clone()] };
+        let (chat, cancel) = (Scripted::new(&["ENGLISH"]), AtomicBool::new(false));
+        let job = Job::new(&game, &chat, &|_| {}, &cancel).unwrap();
+        assert!(job.english_under(&part, &label).unwrap());
+        assert!(!job.english_under(&part, &english).unwrap(), "nothing is under the English");
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
     fn a_label_left_between_readings_takes_the_word_another_label_on_its_picture_settled_on() {
         let game = std::env::temp_dir().join(format!("vntl_settle_{}", std::process::id()));
         let gui = game.join("game").join("gui");
@@ -3243,6 +3418,8 @@ mod tests {
     fn look_alike_letters_are_tried_and_a_slash_only_after_japanese() {
         assert_eq!(look_alikes("バイ"), ["パイ"]);
         assert!(look_alikes("森のケモ/").contains(&"森のケモノ".to_string()));
+        assert!(look_alikes("森のケモ／").contains(&"森のケモノ".to_string()), "as a reading is cleaned");
+        assert!(look_alikes("セーブ／ロード").iter().all(|r| r.contains('／')), "a slash between words is the label's");
         assert!(look_alikes("BGM/SE").is_empty());
         assert!(look_alikes("セーブ").contains(&"セープ".to_string()));
     }

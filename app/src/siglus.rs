@@ -10,7 +10,7 @@ use crate::text::{wrap_words, JA};
 use crate::{original, replace_file, R};
 use regex::Regex;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 const PACK: &str = "Scene.pck";
@@ -526,6 +526,28 @@ impl Game {
         out.extend(self.shown.iter().map(|&(start, end)| (config_key(start), None, self.settings[start..end].to_string())));
         out
     }
+}
+
+/// The system pictures that can be written back: (path, the game's own bytes). They're those
+/// Gameexe.dat names, which the engine draws itself (the message window's frame, the right-click
+/// menu's), and those with "sys" in the name, as the test game's own menus are (`__sys_…`).
+pub fn interface_pictures(game: &Path) -> R<Vec<(PathBuf, Vec<u8>)>> {
+    static QUOTED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]+)""#).unwrap());
+    // without them, the pictures named "sys" still are
+    let settings = original(&game.join(PACK)).and_then(|b| Pack::read(b, None)).and_then(|p| config_text(game, &p.key)).unwrap_or_default();
+    let named: HashSet<String> = QUOTED.captures_iter(&settings).map(|c| c[1].to_lowercase()).collect();
+    let wanted = |stem: String| stem.contains("sys") || named.contains(&stem);    let mut paths: Vec<PathBuf> = std::fs::read_dir(game.join("g00")).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("g00")) && p.file_stem().is_some_and(|n| wanted(n.to_string_lossy().to_lowercase())))
+        .collect();
+    paths.sort();
+    let mut out = Vec::new();
+    for p in paths {
+        let b = original(&p)?;
+        if crate::g00::writable(&b) {
+            out.push((p, b));
+        }
+    }
+    Ok(out)
 }
 
 // shortcut: for a game whose Gameexe.dat doesn't say; most of the box sizes seen run to about this
