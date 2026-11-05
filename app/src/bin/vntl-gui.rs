@@ -1023,7 +1023,7 @@ fn run_quiet_install(folder: &str, files_only: bool) -> ! {
 fn version_text() -> String {
     let commit = env!("KIDOKU_COMMIT");
     let from = if commit.is_empty() { String::new() } else { format!("  ·  build {commit}") };
-    format!("{}{from}  ·  {}", env!("CARGO_PKG_VERSION"), env!("KIDOKU_BUILT"))
+    format!("{}{from}  ·  {}", env!("CARGO_PKG_VERSION").replace('+', "."), env!("KIDOKU_BUILT"))
 }
 
 fn main() -> Result<(), slint::PlatformError> {

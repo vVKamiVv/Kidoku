@@ -44,8 +44,9 @@ fn plain(body: &str) -> String {
     said.join("\n\n")
 }
 
+/// Cargo takes three numbers, so a fourth, as 0.1.9.1, is written 0.1.9+1 there.
 fn numbers(version: &str) -> Option<Vec<u32>> {
-    version.trim_start_matches('v').split('.').map(|n| n.parse().ok()).collect()
+    version.trim_start_matches('v').split(['.', '+']).map(|n| n.parse().ok()).collect()
 }
 
 /// Whether `version` comes after `current`. One that can't be read never does.
@@ -234,6 +235,8 @@ mod tests {
         assert!(newer("v0.1.10", "0.1.9") && newer("0.2.0", "0.1.9") && newer("1.0", "0.9.9"));
         assert!(!newer("0.1.1", "0.1.1") && !newer("v0.1.0", "0.1.1"));
         assert!(!newer("nightly", "0.1.1"), "what can't be read isn't newer");
+        // a fourth number, which Cargo has after a +
+        assert!(newer("v0.1.9.1", "0.1.9") && !newer("v0.1.9.1", "0.1.9+1") && newer("v0.1.10", "0.1.9+1"));
     }
 
     #[test]

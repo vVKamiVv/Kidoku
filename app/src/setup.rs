@@ -91,7 +91,7 @@ fn register(key: &str, program: &Path) -> R<()> {
     let size = fs::metadata(program).map_err(|e| e.to_string())?.len() / 1024;
     for (name, value) in [
         ("DisplayName", "Kidoku".to_string()),
-        ("DisplayVersion", env!("CARGO_PKG_VERSION").to_string()),
+        ("DisplayVersion", env!("CARGO_PKG_VERSION").replace('+', ".")),
         ("Publisher", "Kidoku".to_string()),
         ("DisplayIcon", program.display().to_string()),
         ("InstallLocation", folder.display().to_string()),
