@@ -24,9 +24,10 @@ use std::sync::LazyLock;
 /// Loanwords menus are full of, for the image model to read look-alike katakana by.
 // short words it reads anyway are left out: given one, it answers it for an arrow or a dot
 const MENU_WORDS: [&str; 13] = ["フルスクリーン", "キャンセル", "スキップ", "オート", "テキスト", "メッセージ", "バックログ", "システム", "クイック", "カーソル", "マウス", "エフェクト", "ムービー"];
-/// Loanwords both the image and the story's model take for another English word, with what a menu
-/// means by them: ノーウェイト came out "No Weight" from each.
-const SOUND_ALIKES: [(&str, &str); 1] = [("ウェイト", "ウェイト is wait, a pause, not weight")];
+/// Loanwords that are two English words, with which a menu means: both the image and the story's model
+/// wrote ノーウェイト as "No Weight". The other labels beside it tell a settings screen from, say, a
+/// character's profile.
+const SOUND_ALIKES: [(&str, &str); 1] = [("ウェイト", "ウェイト on a settings screen is a wait, a pause as between lines; elsewhere it can be weight")];
 static READ_PROMPT: LazyLock<String> = LazyLock::new(|| format!(
     "This image is one label from the menus of a Japanese visual novel: its settings, save, load or title screens. \
      Write out exactly the Japanese text it shows, nothing else, and leave out an English line printed under it as a subtitle. \
