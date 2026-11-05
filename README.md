@@ -210,6 +210,8 @@ vntl write <game>
 
 This repo holds no game files. Please use the app on games you own.
 
+Something went wrong? [Open an issue](https://github.com/vVKamiVv/Kidoku/issues/new/choose): the form asks for your PC, models and games.
+
 ## `>>8` License
 
 Kidoku is free software under the [GNU General Public License, version 3](LICENSE). The window is made with [Slint](https://slint.dev), used under the same license.

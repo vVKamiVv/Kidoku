@@ -1,0 +1,54 @@
+name: Something went wrong
+description: A crash, an error, or English that came out wrong in a game or a picture
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead. A screenshot helps for a picture or a line in the game.
+    validations:
+      required: true
+  - type: textarea
+    id: games
+    attributes:
+      label: Games and engines
+      description: Each game you tried, and the engine the Game tab names for it.
+      placeholder: "Game title — KiriKiri"
+    validations:
+      required: true
+  - type: textarea
+    id: models
+    attributes:
+      label: Models
+      description: As picked on the Model tab. Write "none" for one you didn't pick.
+      value: |
+        Model:
+        Image model:
+        Menu reading model:
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kidoku version
+      description: On the About tab.
+      placeholder: "0.1.9"
+    validations:
+      required: true
+  - type: textarea
+    id: pc
+    attributes:
+      label: Your PC
+      value: |
+        Windows version:
+        CPU:
+        GPU and its memory:
+        RAM:
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: A screenshot of the window's last log lines, or the error they show typed out.
