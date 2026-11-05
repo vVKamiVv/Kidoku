@@ -259,7 +259,7 @@ pub const READING_MODEL: &str = "qwen2.5vl:7b";
 pub const IMAGE_OFFERS: [Offer; 8] = [
     Offer { title: "Text reader (meikiocr)", model: TEXT_READER, size: "33 MB", gpu: "CPU", note: "Reads Japanese in menus and screenshots, for any GPU. Get this first." },
     Offer { title: "Font pack (20 free fonts)", model: FONT_PACK, size: "110 MB", gpu: "CPU", note: "More looks for repainted images, brush lettering too. The first match takes longer." },
-    Offer { title: "Inpainting (LaMa)", model: INPAINTER, size: "208 MB", gpu: "CPU", note: "Cleaner Text over artwork. Takes a few seconds per picture." },
+    Offer { title: "Inpainting (anime LaMa)", model: INPAINTER, size: "207 MB", gpu: "CPU", note: "Cleaner Text over artwork. Takes a few seconds per picture." },
     Offer { title: "Qwen 2.5 VL 7B", model: READING_MODEL, size: "6.0 GB", gpu: "GPU 8 GB", note: "Reads menu text best. Used as the menu reading model, beside an image model for the English." },
     Offer { title: "Gemma 3 12B", model: IMAGE_MODEL, size: "8.2 GB", gpu: "GPU 12 GB", note: "The one tested most with this app. Slower on 8 GB." },
     Offer { title: "Gemma 4 12B", model: "gemma4:12b", size: "8.0 GB", gpu: "GPU 12 GB", note: "Newer than Gemma 3. Not tested with this app yet." },

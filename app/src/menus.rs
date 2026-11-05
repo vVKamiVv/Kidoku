@@ -374,10 +374,13 @@ pub fn read_png(data: &[u8]) -> R<Image> {
     Ok(Image { w: info.width as usize, h: info.height as usize, px })
 }
 
-/// A PNG, or the WebP or JPEG a game keeps its pictures in instead.
+/// A PNG, or the WebP, JPEG or AVIF a game keeps its pictures in instead.
 pub fn read_picture(data: &[u8]) -> R<Image> {
     if data.starts_with(PNG) {
         return read_png(data);
+    }
+    if crate::avif::is_avif(data) {
+        return crate::avif::read(data);
     }
     let img = image::load_from_memory(data).map_err(|e| e.to_string())?.into_rgba8();
     let (w, h) = (img.width() as usize, img.height() as usize);
@@ -386,12 +389,15 @@ pub fn read_picture(data: &[u8]) -> R<Image> {
 
 /// Whether a lower-case file name is a picture `read_picture` takes.
 pub(crate) fn is_picture(name: &str) -> bool {
-    [".png", ".webp", ".jpg", ".jpeg"].iter().any(|e| name.ends_with(e))
+    [".png", ".webp", ".jpg", ".jpeg", ".avif"].iter().any(|e| name.ends_with(e))
 }
 
 fn picture_height(data: &[u8]) -> Option<u32> {
     if data.starts_with(PNG) {
         return Some(u32::from_be_bytes(data.get(20..24)?.try_into().ok()?));
+    }
+    if crate::avif::is_avif(data) {
+        return crate::avif::height(data);
     }
     image::ImageReader::new(std::io::Cursor::new(data)).with_guessed_format().ok()?.into_dimensions().ok().map(|d| d.1)
 }
@@ -506,9 +512,14 @@ fn nearest_name(people: &[Vec<char>], reading: &str) -> Option<String> {
 /// Whether a picture has Japanese in it: a plain question the model answers well, though reading
 /// freely it turns English and shapes into Japanese words.
 fn shows_japanese(vision: &dyn Chat, png: &[u8]) -> R<bool> {
+    Ok(text_kind(vision, png)?.starts_with("JAPANESE"))
+}
+
+/// What a picture's text is written in: JAPANESE, ENGLISH or NONE, as the model says it.
+fn text_kind(vision: &dyn Chat, png: &[u8]) -> R<String> {
     let prompt = "This image is cut from the menus of a Japanese visual novel. Is any text in it written in Japanese letters \
                   (kana or kanji)? Reply JAPANESE if it is, ENGLISH if its only text is in Latin letters or digits, or NONE if it has no text.";
-    Ok(vision.read_image(png, prompt)?.trim_start().to_uppercase().starts_with("JAPANESE"))
+    Ok(vision.read_image(png, prompt)?.trim_start().to_uppercase())
 }
 
 /// What a name plate says, if it's Japanese: the text reader's reading, or the model's if it saw
@@ -750,6 +761,35 @@ fn paintable(reply: &str, reading: &str) -> Option<String> {
     (!first.is_empty() && !JA.is_match(first) && has(['(', '（']) && has(['[', '［'])).then(|| first.to_string())
 }
 
+/// Whether a reading could be drawn in its block: in one taller than wide, letters down a column at
+/// least 0.6 of its width tall. A shape read as a word, as ♪ read システム, isn't. A wide block can
+/// hold a line with a smaller one under it, so its height says little of its letters.
+fn fits(b: &Block, reading: &str) -> bool {
+    let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+    w >= h || reading.chars().count() as f32 * w as f32 * 0.6 <= h as f32
+}
+
+/// Labels in batches for the model, by the picture each is on: whole pictures together, up to 20
+/// labels. A label's English then hangs on its own picture's labels, not on whichever others shared
+/// its batch, and since a batch ends after a picture by its name, a change on one picture moves no
+/// other's batch.
+fn batches(pictures: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let ends = |name: &str| name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)) % 4 == 0;
+    let (mut out, mut start) = (Vec::new(), 0);
+    for i in 0..pictures.len() {
+        let last = i + 1 == pictures.len();
+        let picture_done = last || pictures[i + 1] != pictures[i];
+        // the next picture's labels, which may not fit in this batch
+        let next = if picture_done && !last { pictures[i + 1..].iter().take_while(|p| **p == pictures[i + 1]).count() } else { 0 };
+        let size = i + 1 - start;
+        if last || size == 20 || (picture_done && (size + next > 20 || ends(pictures[i]))) {
+            out.push(start..i + 1);
+            start = i + 1;
+        }
+    }
+    out
+}
+
 /// Translate some of a screen's labels together: each gives the others context, and the readings
 /// of one label correct each other. None if the reply can't be read.
 fn translate_screen(vision: &dyn Chat, keys: &[(String, usize, String)]) -> R<Option<Vec<String>>> {
@@ -760,7 +800,7 @@ fn translate_screen(vision: &dyn Chat, keys: &[(String, usize, String)]) -> R<Op
          other labels. They are the titles, buttons and settings of a game's menus, not its story. Translate each one into the \
          concise English a game menu would show for it, within its character limit: only the label's own words, nothing added to \
          explain it. A reading that is no real word is a word misread by a letter or two: translate that word. \
-         A name stays that name, in English letters. \
+         A name stays that name, in English letters. A letter and a dot before a word shorten another word, as Q. for Quick and A. for Auto. \
          Reply with exactly {n} lines formatted '<number>: <English>' and nothing else.\n\n{}",
         list.join("\n"),
         n = keys.len()
@@ -937,6 +977,56 @@ impl<'a> Job<'a> {
         read_block(self.vision, &write_png(&block_image(part, b, scale))?)
     }
 
+    /// Whether a label's last line is English in smaller letters than its first, as "play" under 再生.
+    fn english_under(&self, part: &Part, b: &Block) -> R<bool> {
+        let (w, h) = (b.x1 - b.x0, b.y1 - b.y0);
+        // any ink shown counts, as a greyed-out state's faint letters; a row with a pixel or two is
+        // a gap, as an "l" can reach up to touch the line above
+        let shown = |x: usize, y: usize| {
+            let p = part.img.px[(b.y0 + y) * part.img.w + b.x0 + x];
+            if part.bg == CLEAR { p >> 24 < 250 } else { differs(p, part.bg) }
+        };
+        let inked = |y: usize| (0..w).filter(|&x| shown(x, y)).count() >= 3;
+        let mut lines: Vec<(usize, usize)> = Vec::new();
+        for y in (0..h).filter(|&y| inked(y)) {
+            match lines.last_mut() {
+                Some(l) if l.1 == y => l.1 = y + 1,
+                _ => lines.push((y, y + 1)),
+            }
+        }
+        if lines.len() == 1 {
+            // an icon beside both lines joins them, as ▶ beside 再生 over "play": the label is past it
+            let tall = lines[0].1 - lines[0].0;
+            return match first_mark(b).filter(|m| m.3 * 4 >= tall * 3) {
+                Some((next, ..)) => self.english_under(part, &columns_of(b, next, w)),
+                None => Ok(false),
+            };
+        }
+        if lines.is_empty() {
+            return Ok(false);
+        }
+        let ((t0, t1), (u0, u1)) = (lines[0], lines[lines.len() - 1]);
+        if (u1 - u0) * 4 > (t1 - t0) * 3 {
+            return Ok(false);
+        }
+        // the line with the tops and tails of its letters, from the line above it to the bottom
+        let (u0, u1) = (lines[lines.len() - 2].1, h);
+        // and alone: what's above it, faint as a greyed-out state's letters are, isn't shown
+        let (mut img, iw) = (part.img.clone(), part.img.w);
+        (b.y0..b.y0 + u0).flat_map(|y| (b.x0..b.x1).map(move |x| y * iw + x)).for_each(|i| img.px[i] = part.bg);
+        let alone = Part { entry: part.entry, sprite: part.sprite, at: part.at, name: String::new(), img, bg: part.bg, blocks: Vec::new() };
+        let line = block_image(&alone, &Block { y0: b.y0 + u0, y1: b.y0 + u1, mask: b.mask[u0 * w..u1 * w].to_vec(), ..b.clone() }, 4);
+        // either reader seeing Latin letters will do: the model can call a clear "PAGE 1" no text
+        let read = match &self.reader {
+            Some(reader) => reader.line(&line)?,
+            None => String::new(),
+        };
+        if read.chars().filter(char::is_ascii_alphabetic).count() >= 2 && !JA.is_match(&read) {
+            return Ok(true);
+        }
+        Ok(text_kind(self.vision, &write_png(&line)?)?.starts_with("ENGLISH"))
+    }
+
     /// The image model's reading, checked against the text reader's.
     fn read_fresh(&self, img: &Image, png: &[u8]) -> R<String> {
         let text = clean(read_block(self.vision, png)?);
@@ -984,12 +1074,13 @@ impl<'a> Job<'a> {
         Ok(picked.unwrap_or(if junk { format!("{text}{BOTH}{seen}") } else { format!("{seen}{BOTH}{text}") }))
     }
 
-    /// Get English for `todo`, 20 at a time as story lines go: one bad reply can't sink a whole folder
-    /// of images. A label left without any keeps its Japanese, and the next run asks again.
-    fn translate_labels(&mut self, screen: &str, todo: &[(String, usize, String)]) -> R<()> {
+    /// Get English for `todo`, each label on the picture named in `pictures`, a few pictures at a time:
+    /// one bad reply can't sink a whole folder of images. A label left without any keeps its Japanese,
+    /// and the next run asks again.
+    fn translate_labels(&mut self, screen: &str, todo: &[(String, usize, String)], pictures: &[&str]) -> R<()> {
         let stopped = || self.cancel.load(Ordering::Relaxed);
         let mut missed = 0;
-        for chunk in todo.chunks(20) {
+        for chunk in batches(pictures).into_iter().map(|r| &todo[r]) {
             if stopped() {
                 return Err("Stopped".into());
             }
@@ -1024,11 +1115,13 @@ impl<'a> Job<'a> {
             let here: Vec<(&Block, String)> = parts.iter().filter(|p| p.entry == entry).flat_map(|p| &p.blocks)
                 .map(|b| (b, groups[b.group].reads.join(BOTH))).filter(|(_, k)| self.labels.contains_key(k)).collect();
             let ours = |k: &String| todo.iter().any(|t| t.0 == *k);
+            // labels read the same, one way at least, are one word drawn twice, as 彩度 small and large
+            let shared = |ka: &str, kb: &str| ka.split(BOTH).any(|r| kb.split(BOTH).any(|s| s == r));
             let mut clash: IndexMap<String, BTreeSet<String>> = IndexMap::new();
             for (i, (a, ka)) in here.iter().enumerate() {
                 for (b, kb) in &here[i + 1..] {
                     let en = &self.labels[ka];
-                    if kb != ka && ours(ka) && ours(kb) && self.labels[kb].eq_ignore_ascii_case(en) && !same_text(a, b, 80) {
+                    if kb != ka && ours(ka) && ours(kb) && self.labels[kb].eq_ignore_ascii_case(en) && !same_text(a, b, 80) && !shared(ka, kb) {
                         clash.entry(en.clone()).or_default().extend([ka.clone(), kb.clone()]);
                     }
                 }
@@ -1119,10 +1212,19 @@ impl<'a> Job<'a> {
     /// The parts of one screen that got English: (index into `parts`, repainted image).
     fn screen(&mut self, screen: &str, parts: &mut [Part]) -> R<Vec<(usize, Image)>> {
         let mut groups: Vec<Group> = Vec::new();
+        // a reading is kept by where its block sits in its picture, so when blocks are found
+        // differently later, only those that moved are read again
+        let mut taken: HashMap<String, usize> = HashMap::new();
+        let keys: Vec<Vec<String>> = parts.iter().map(|p| p.blocks.iter().map(|b| {
+            let at = format!("{screen}|{}@{},{},{}x{}", p.name, p.at.0 + b.x0 as i32, p.at.1 + b.y0 as i32, b.x1 - b.x0, b.y1 - b.y0);
+            let n = taken.entry(at.clone()).or_default();
+            *n += 1;
+            if *n == 1 { at } else { format!("{at}#{n}") }
+        }).collect()).collect();
         // what the image model reads, it reads well: only a near copy is taken as the same label
         let alike = if self.vision_first { 96 } else { 80 };
         for p in 0..parts.len() {
-            for b in 0..parts[p].blocks.len() {
+            for (b, key) in keys[p].iter().enumerate() {
                 // one image never shows a label twice: its look-alikes are different words
                 let found = groups.iter().position(|g| g.first.0 != p && same_text(&parts[g.first.0].blocks[g.first.1], &parts[p].blocks[b], alike));
                 let id = match found {
@@ -1131,7 +1233,7 @@ impl<'a> Job<'a> {
                         id
                     }
                     None => {
-                        groups.push(Group { key: format!("{screen}|{}#{b}", parts[p].name), first: (p, b), second: None, reads: Vec::new() });
+                        groups.push(Group { key: key.clone(), first: (p, b), second: None, reads: Vec::new() });
                         groups.len() - 1
                     }
                 };
@@ -1141,7 +1243,8 @@ impl<'a> Job<'a> {
         (self.report)(Event::Log(format!("Reading {} labels in {screen}", groups.len())));
         let mut split: Vec<(usize, usize, String)> = Vec::new();
         let mut read_on: HashMap<usize, Vec<String>> = HashMap::new();
-        for g in groups.iter_mut() {
+        let mut fresh = Vec::new();
+        for (i, g) in groups.iter_mut().enumerate() {
             if self.cancel.load(Ordering::Relaxed) {
                 return Err("Stopped".into());
             }
@@ -1150,15 +1253,21 @@ impl<'a> Job<'a> {
             let pictures: Vec<usize> = [Some(g.first), g.second].into_iter().flatten().map(|(p, _)| parts[p].entry).collect();
             let mut note = |reads: &[String]| pictures.iter().for_each(|e| read_on.entry(*e).or_default().extend(reads.iter().take(1).cloned()));
             // a look-alike the image model reads differently is another label, as 右 beside 左
-            let other = g.second.filter(|_| self.vision_first).map(|(c, d)| (c, d, format!("{screen}|{}#{d}", parts[c].name)));
+            let other = g.second.filter(|_| self.vision_first).map(|(c, d)| (c, d, keys[c][d].clone()));
             if let Some(r) = self.cached.get(&g.key) {
                 g.reads = r.clone();
                 note(r);
                 split.extend(other.filter(|o| self.cached.contains_key(&o.2)));
                 continue;
             }
-            // a second look at the same text: the other state, or a different enlargement
             let (a, b) = g.first;
+            // a label with its own English printed under it, as 再生 over "play", needs no repaint
+            if self.english_under(&parts[a], &parts[a].blocks[b])? {
+                self.cached.insert(g.key.clone(), Vec::new());
+                save_json(&self.reads_path, &self.cached)?;
+                continue;
+            }
+            // a second look at the same text: the other state, or a different enlargement
             let first = self.read(&parts[a], &parts[a].blocks[b], 4)?;
             let mut second = match g.second {
                 Some((c, d)) => self.read(&parts[c], &parts[c].blocks[d], 4)?,
@@ -1177,7 +1286,8 @@ impl<'a> Job<'a> {
             }
             // on a picture a guess at a shape won't come out the same twice, as a label will
             let agreed = !self.reader_only || clean(first.clone()) == clean(second.clone());
-            g.reads = [first, second].iter().flat_map(|t| t.split(BOTH)).map(|t| clean(t.to_string())).filter(|t| agreed && JA.is_match(t)).collect();
+            let block = &parts[a].blocks[b];
+            g.reads = [first, second].iter().flat_map(|t| t.split(BOTH)).map(|t| clean(t.to_string())).filter(|t| agreed && JA.is_match(t) && fits(block, t)).collect();
             let mut once = BTreeSet::new();
             g.reads.retain(|r| once.insert(r.clone()));
             // a reading that is another plus extra characters is that reading with junk on the end
@@ -1186,11 +1296,64 @@ impl<'a> Job<'a> {
             note(&g.reads);
             self.cached.insert(g.key.clone(), g.reads.clone());
             save_json(&self.reads_path, &self.cached)?;
+            fresh.push(i);
+        }
+        // a label left between two readings takes a word another label on its picture was read as, a
+        // letter or so off, unless the picture says otherwise: a small 彩度 read 移園 / 彩思 beside a
+        // larger 彩度. A long reading looks across the screen, and takes the other word where the picture,
+        // or failing it the words model, says so: a pop-up's song title in decorative letters, read
+        // 星降る夏に, beside a list of songs that has 星降る夜に plainly. Those go first:
+        // a label read several ways, one of which another label was read as alone, is that word
+        fresh.sort_by_key(|&i| groups[i].reads.len() != 1);
+        for i in fresh {
+            let entry = parts[groups[i].first.0].entry;
+            // what the others were read as, less this label's own readings, which tell nothing
+            let others = |here: bool| -> Vec<Vec<char>> {
+                groups.iter().enumerate().filter(|(j, o)| *j != i && (!here || parts[o.first.0].entry == entry))
+                    .flat_map(|(_, o)| o.reads.iter().filter(|r| !groups[i].reads.contains(r)).map(|r| r.chars().collect())).collect()
+            };
+            let reads = &groups[i].reads;
+            if reads.len() > 1 {
+                let alone: BTreeSet<&String> = groups.iter().enumerate().filter(|(j, o)| *j != i && o.reads.len() == 1).map(|(_, o)| &o.reads[0]).collect();
+                if let Some(word) = reads.iter().find(|r| alone.contains(r)).cloned() {
+                    groups[i].reads = vec![word];
+                    self.cached.insert(groups[i].key.clone(), groups[i].reads.clone());
+                    save_json(&self.reads_path, &self.cached)?;
+                    continue;
+                }
+            }
+            let found = match &reads[..] {
+                [] => None,
+                [one] => nearest(&others(false), one).map(|w| (w, one.clone())),
+                reads => reads.iter().find_map(|r| Some((nearest_name(&others(true), r)?, r.clone()))),
+            };
+            let Some((word, reading)) = found else { continue };
+            let (a, b) = groups[i].first;
+            let block = &parts[a].blocks[b];
+            let png = write_png(&block_image(&parts[a], block, 4.max(72 / (block.y1 - block.y0).max(1))))?;
+            let picked = choose(self.vision, &png, &word, &reading)?;
+            let take = match (groups[i].reads.len(), picked) {
+                (1, Some(p)) => p == word,
+                (1, None) => likelier(self.vision, &word, &reading, &[])?.as_deref() == Some(word.as_str()),
+                (_, picked) => picked.as_deref() != Some(reading.as_str()),
+            };
+            if take {
+                groups[i].reads = vec![word];
+                self.cached.insert(groups[i].key.clone(), groups[i].reads.clone());
+                save_json(&self.reads_path, &self.cached)?;
+            }
         }
         for (c, d, key) in split {
             let reads = self.cached[&key].clone();
             parts[c].blocks[d].group = groups.len();
             groups.push(Group { key, first: (c, d), second: None, reads });
+        }
+        // and what was read where no block sits now goes
+        let (used, prefix): (BTreeSet<&String>, String) = (keys.iter().flatten().collect(), format!("{screen}|"));
+        let before = self.cached.len();
+        self.cached.retain(|k, _| !k.starts_with(&prefix) || used.contains(k));
+        if self.cached.len() != before {
+            save_json(&self.reads_path, &self.cached)?;
         }
 
         let key = |g: &Group| g.reads.join(BOTH);
@@ -1217,9 +1380,10 @@ impl<'a> Job<'a> {
                 self.labels.entry(key(g)).or_insert(en);
             }
         }
-        let todo: Vec<(String, usize, String)> =
-            groups.iter().filter(|g| !g.reads.is_empty() && !self.labels.contains_key(&key(g))).map(|g| (key(g), room(g), hint(g))).collect();
-        self.translate_labels(screen, &todo)?;
+        let new: Vec<&Group> = groups.iter().filter(|g| !g.reads.is_empty() && !self.labels.contains_key(&key(g))).collect();
+        let todo: Vec<(String, usize, String)> = new.iter().map(|g| (key(g), room(g), hint(g))).collect();
+        let pictures: Vec<&str> = new.iter().map(|g| parts[g.first.0].name.as_str()).collect();
+        self.translate_labels(screen, &todo, &pictures)?;
         self.tell_apart(parts, &groups, &todo)?;
         let samples: Vec<Sample> = groups.iter().filter(|g| !g.reads.is_empty()).take(SAMPLES).map(|g| sample(&parts[g.first.0].blocks[g.first.1], &g.reads[0])).collect();
         if !self.matched && !samples.is_empty() {
@@ -1389,7 +1553,7 @@ pub fn translate_renpy_menus(game: &Path, lang: &str, vision: &dyn Chat, report:
 }
 
 /// Put repainted images where Ren'Py takes them over the game's own, and keep count of them. They're
-/// always PNG, under the old name if that's a WebP or a JPEG: the engine goes by what's in a file.
+/// always PNG, under the old name if that's a WebP, JPEG or AVIF: the engine goes by what's in a file.
 fn write_overrides(tl: &Path, ours_path: &Path, mut ours: BTreeSet<String>, changed: &[(String, Image)]) -> R<()> {
     // listed before they are written: an unlisted file looks official, and Remove would never find it
     ours.extend(changed.iter().map(|(name, _)| name.clone()));
@@ -1538,9 +1702,14 @@ impl Job<'_> {
         }
 
         let shown = |t: &String| t.chars().count() >= 2;
-        let texts: BTreeSet<&String> = wanted.iter().filter_map(|p| seen.get(p)).flatten().map(|r| &r.1).filter(|t| shown(t)).collect();
-        let todo: Vec<(String, usize, String)> = texts.iter().filter(|t| !self.labels.contains_key(**t)).map(|t| ((*t).clone(), t.chars().count() * 3, "text inside a picture of the story, such as a sign or a note; ".to_string())).collect();
-        self.translate_labels("artwork", &todo)?;
+        // each text once, with the first picture it's on
+        let mut asked = BTreeSet::new();
+        let (todo, pictures): (Vec<(String, usize, String)>, Vec<&str>) = wanted.iter()
+            .flat_map(|p| seen.get(p).into_iter().flatten().map(move |r| (&r.1, p.as_str())))
+            .filter(|(t, _)| shown(t) && !self.labels.contains_key(*t) && asked.insert(*t))
+            .map(|(t, p)| ((t.clone(), t.chars().count() * 3, "text inside a picture of the story, such as a sign or a note; ".to_string()), p))
+            .unzip();
+        self.translate_labels("artwork", &todo, &pictures)?;
         let mut changed = Vec::new();
         for path in wanted {
             let rows: Vec<(Area, &String)> = seen.get(path).into_iter().flatten().filter_map(|(a, t)| Some((*a, self.labels.get(t)?))).collect();
@@ -1677,6 +1846,28 @@ fn period(img: &Image, paper: u32) -> Option<usize> {
         let (side, gap) = (most(&lengths)?, most(&gaps)?);
         (side == gap && (2..=32).contains(&side)).then_some(2 * side)
     })
+}
+
+/// Pairs of close colours a face alternates row by row, as a striped button's: (the commoner, the other).
+fn stripes(img: &Image) -> Vec<(u32, u32)> {
+    let w = img.w;
+    let mut pairs: HashMap<(u32, u32), usize> = HashMap::new();
+    for i in 0..w * img.h.saturating_sub(2) {
+        let (a, b, c) = (img.px[i], img.px[i + w], img.px[i + 2 * w]);
+        if a >> 24 == 0 && b >> 24 == 0 && a == c && a != b && !differs(a, b) {
+            *pairs.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    let count = |p: u32| img.px.iter().filter(|q| **q == p).count();
+    // a face's worth, not a few rows of a gradient
+    pairs.into_iter().filter(|(_, n)| *n >= 1000).map(|((a, b), _)| if count(a) >= count(b) { (a, b) } else { (b, a) }).collect()
+}
+
+/// The face colour of `stripe` that row `y` shows nearest `x`, where the repaint left it.
+fn row_stripe(img: &Image, stripe: (u32, u32), changed: &dyn Fn(usize, usize) -> bool, x: usize, y: usize) -> Option<u32> {
+    let row = &img.px[y * img.w..(y + 1) * img.w];
+    (1..img.w).flat_map(|d| [x.checked_sub(d), Some(x + d).filter(|&x| x < img.w)]).flatten()
+        .find(|&i| !changed(i, y) && (row[i] == stripe.0 || row[i] == stripe.1)).map(|i| row[i])
 }
 
 /// What lies under text on paper: the pattern a whole number of steps along the row, from a pixel
@@ -1926,11 +2117,10 @@ fn sheet_parts(entry: usize, name: &str, img: Image, at: (usize, usize), parts: 
         apart(&row).into_iter().any(|a| shapes(&cut(&row, a), CLEAR).iter().any(is_solid))
     };
     let inside: Vec<Block> = shapes(&img, CLEAR).into_iter().filter(|s| (s.x1 - s.x0, s.y1 - s.y0) != (img.w, img.h) && (is_solid(s) || s.y1 - s.y0 > TALLEST_LABEL || buttons(s))).collect();
-    let piece = format!("{name}@{},{}", at.0, at.1);
     // a sheet's options sit under their setting, not after it on the row, so none takes a hint from its row
-    if let Some(mut p) = scan(entry, None, (at.0 as i32, at.1 as i32), piece, img.clone()) {
-        // a block read as pieces of its own below isn't read whole here, nor split into lines
-        p.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL && !inside.iter().any(|s| (s.x0, s.y0, s.x1, s.y1) == (b.x0, b.y0, b.x1, b.y1)));
+    if let Some(mut p) = scan(entry, None, (at.0 as i32, at.1 as i32), name.to_string(), img.clone()) {
+        // a block read as pieces of its own below, or in one, isn't read here, nor split into lines
+        p.blocks.retain(|b| b.y1 - b.y0 <= TALLEST_LABEL && !inside.iter().any(|s| s.x0 <= b.x0 && b.x1 <= s.x1 && s.y0 <= b.y0 && b.y1 <= s.y1));
         // labels on nothing can stand one above another; inside a button, two lines are one label
         p.blocks = if p.bg == CLEAR { split_lines(std::mem::take(&mut p.blocks)) } else { join_lines(std::mem::take(&mut p.blocks)) };
         parts.extend((!p.blocks.is_empty()).then_some(p));
@@ -1997,19 +2187,22 @@ pub fn translate_bgi_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str
     let (mut parts, mut own) = (Vec::new(), Vec::new());
     for (i, (name, b)) in files.iter().enumerate() {
         let img = bgi::picture(b).ok_or(format!("{name}: not a picture"))?;
-        if flat_background(&img) != Some(CLEAR) {
-            parts.extend(label_part(i, name.clone(), img.clone()));
-            own.push((img, Vec::new()));
+        // a striped face is read as its commoner colour, and its stripes go back where a repaint wipes them
+        let stripes = stripes(&img);
+        let mut bare = img.clone();
+        bare.px.iter_mut().for_each(|q| *q = stripes.iter().find(|s| s.1 == *q).map_or(*q, |s| s.0));
+        if flat_background(&bare) != Some(CLEAR) {
+            parts.extend(label_part(i, name.clone(), bare));
+            own.push((img, Vec::new(), stripes));
             continue;
         }
         // text is read with the paper taken away, and the paper's pattern goes back under the English
         let papers = papers(&img);
-        let mut bare = img.clone();
         bare.px.iter_mut().filter(|q| papers.iter().any(|p| p.0 == **q)).for_each(|q| *q = CLEAR);
         let start = parts.len();
         sheet_parts(i, name, bare, (0, 0), &mut parts);
         strip_marks(&mut parts[start..]);
-        own.push((img, papers));
+        own.push((img, papers, stripes));
     }
     job.vision_first = true;
     let changed = job.screen("sysgrp", &mut parts)?;
@@ -2029,7 +2222,7 @@ pub fn translate_bgi_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str
     }
     let mut sheets: IndexMap<usize, Image> = IndexMap::new();
     for (entry, n) in new_px.iter_mut() {
-        let (whole, papers) = &own[*entry];
+        let (whole, papers, stripes) = &own[*entry];
         let mut sheet = whole.clone();
         // a light outline can be the paper's very colour, so it went with the paper and wasn't
         // erased with its letters: paper colour beside what was is the pattern again
@@ -2042,7 +2235,10 @@ pub fn translate_bgi_menus(game: &Path, vision: &dyn Chat, english: &dyn Fn(&str
         beside.into_iter().for_each(|at| { n.entry(at).or_insert(CLEAR); });
         let changed = |x: usize, y: usize| n.contains_key(&(y * whole.w + x));
         for (&at, &new) in n.iter() {
-            let mut px = under(whole, papers, &changed, at % whole.w, at / whole.w);
+            let (x, y) = (at % whole.w, at / whole.w);
+            // a stripe wiped down to the face shows its row's own colour again
+            let new = stripes.iter().find(|s| s.0 == new).and_then(|&s| row_stripe(whole, s, &changed, x, y)).unwrap_or(new);
+            let mut px = under(whole, papers, &changed, x, y);
             over(&mut px, rgb(new), (255 - (new >> 24)) as f32 / 255.0);
             sheet.px[at] = px;
         }
@@ -2324,7 +2520,7 @@ mod tests {
         }
         let mut parts = Vec::new();
         sheet_parts(7, "s", sheet, (0, 0), &mut parts);
-        assert_eq!(parts.iter().map(|p| (p.entry, p.name.as_str(), p.at, p.blocks.len(), p.bg)).collect::<Vec<_>>(), [(7, "s@150,30", (150, 30), 1, 0)]);
+        assert_eq!(parts.iter().map(|p| (p.entry, p.name.as_str(), p.at, p.blocks.len(), p.bg)).collect::<Vec<_>>(), [(7, "s", (150, 30), 1, 0)]);
     }
 
     #[test]
@@ -2624,13 +2820,34 @@ mod tests {
         };
         let mut job = Job::new(&game, &chat, &report, &cancel).unwrap();
         let todo: Vec<(String, usize, String)> = (0..22).map(|i| (format!("k{i}"), 9, String::new())).collect();
-        job.translate_labels("s", &todo).unwrap();
+        let one_picture = ["p"; 22];
+        job.translate_labels("s", &todo, &one_picture).unwrap();
         assert_eq!((job.labels.len(), job.labels["k18"].as_str(), job.labels["k21"].as_str()), (20, "Ok", "Load"));
         assert!(!job.labels.contains_key("k19") && !job.labels.contains_key("k20"));
         assert_eq!(load_labels(&job.labels_path).unwrap(), job.labels, "saved as it goes");
         assert_eq!(log.borrow().as_slice(), ["2 labels in s stay in Japanese; run again to retry them."]);
-        assert!(job.translate_labels("s", &todo).is_err(), "the server failing is not a bad reply");
+        assert!(job.translate_labels("s", &todo, &one_picture).is_err(), "the server failing is not a bad reply");
         std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn labels_go_to_the_model_a_whole_picture_at_a_time_and_a_change_moves_no_other_batch() {
+        let names: Vec<String> = (0..40).map(|i| format!("menu/{i}.png")).collect();
+        let labels = |counts: &[usize]| -> Vec<&str> { names.iter().zip(counts).flat_map(|(n, c)| std::iter::repeat_n(n.as_str(), *c)).collect() };
+        let counts = [3, 1, 2, 5, 4, 1, 1, 2, 3, 30, 2, 1, 2, 2, 3, 1, 1, 4, 2, 2];
+        let pictures = labels(&counts);
+        let got = batches(&pictures);
+        assert_eq!(got.iter().map(|r| r.len()).sum::<usize>(), pictures.len());
+        assert!(got.iter().all(|r| r.len() <= 20), "{got:?}");
+        assert!(got.windows(2).all(|w| pictures[w[1].start] != pictures[w[1].start - 1] || w[0].len() == 20), "a picture is parted only past 20: {got:?}");
+        // one more label on the fourth picture
+        let mut more = counts;
+        more[3] += 1;
+        let after = batches(&labels(&more));
+        let named = |b: &[std::ops::Range<usize>], p: &[&str]| -> Vec<Vec<String>> { b.iter().map(|r| p[r.clone()].iter().map(|s| s.to_string()).collect()).collect() };
+        let (was, now) = (named(&got, &pictures), named(&after, &labels(&more)));
+        let moved = was.iter().filter(|b| !now.contains(b)).count();
+        assert!(moved <= 1, "only the batch holding that picture changes: {was:?} {now:?}");
     }
 
 
@@ -2685,14 +2902,143 @@ mod tests {
         std::fs::write(images.join("notice.png"), write_png(&tall_picture(0x0020_2020)).unwrap()).unwrap();
         std::fs::write(images.join("sprite.png"), write_png(&tall_picture(CLEAR)).unwrap()).unwrap();
         std::fs::write(images.join("sign.webp"), webp(&tall_picture(0x0040_2020))).unwrap();
+        std::fs::write(images.join("badge.avif"), include_bytes!("../testdata/button.avif")).unwrap();
         let model = crate::llm::tests::Fake(|p: &str| Ok(if p == *READ_PROMPT { "注意".to_string() } else { "1: Notice".to_string() }));
         let said = translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
-        assert!(said.starts_with("Repainted 2 menu images"), "{said}");
+        assert!(said.starts_with("Repainted 3 menu images"), "{said}");
         let tl = game.join("game").join("tl").join("english").join("images");
         assert!(tl.join("notice.png").exists() && !tl.join("sprite.png").exists());
-        assert!(read_png(&std::fs::read(tl.join("sign.webp")).unwrap()).is_ok(), "a PNG under the name the game asks for");
+        for name in ["sign.webp", "badge.avif"] {
+            assert!(read_png(&std::fs::read(tl.join(name)).unwrap()).is_ok(), "a PNG under the name the game asks for: {name}");
+        }
         let again = translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
-        assert!(again.starts_with("Repainted 2 menu images"), "its own copy under tl/ isn't read as a picture: {again}");
+        assert!(again.starts_with("Repainted 3 menu images"), "its own copy under tl/ isn't read as a picture: {again}");
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn a_label_with_its_own_english_under_it_is_asked_about_and_one_line_is_not() {
+        let game = std::env::temp_dir().join(format!("vntl_english_under_{}", std::process::id()));
+        let (w, h) = (40, 22);
+        // a line of letters, and a smaller one under it
+        let mask: Vec<bool> = (0..h).flat_map(|y| (0..w).map(move |x| y < 12 || ((15..21).contains(&y) && x < 20))).collect();
+        let img = Image { w, h, px: mask.iter().map(|m| if *m { 0 } else { CLEAR }).collect() };
+        let part = Part { entry: 0, sprite: None, at: (0, 0), name: "p".into(), img, bg: CLEAR, blocks: Vec::new() };
+        let b = Block { x0: 0, y0: 0, x1: w, y1: h, mask, group: 0 };
+        let (chat, cancel) = (Scripted::new(&["ENGLISH", "JAPANESE", "ENGLISH"]), AtomicBool::new(false));
+        let job = Job::new(&game, &chat, &|_| {}, &cancel).unwrap();
+        assert!(job.english_under(&part, &b).unwrap());
+        assert!(!job.english_under(&part, &b).unwrap(), "a smaller line in Japanese is part of the label");
+        // an icon running down beside both lines, as ▶ beside 再生 over "play"
+        let iconed: Vec<bool> = (0..h).flat_map(|y| (0..w + 10).map(move |x| x < 6 || (x >= 10 && (y < 12 || ((15..21).contains(&y) && x < 30))))).collect();
+        let wide = Part { img: Image { w: w + 10, h, px: iconed.iter().map(|m| if *m { 0 } else { CLEAR }).collect() }, ..part };
+        assert!(job.english_under(&wide, &Block { x1: w + 10, mask: iconed, ..b.clone() }).unwrap(), "the lines are past the icon");
+        let one_line = Block { y1: 12, mask: b.mask[..12 * w].to_vec(), ..b.clone() };
+        assert!(!job.english_under(&wide, &one_line).unwrap(), "and one line isn't asked about: no reply is left");
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn a_label_left_between_readings_takes_the_word_another_label_on_its_picture_settled_on() {
+        let game = std::env::temp_dir().join(format!("vntl_settle_{}", std::process::id()));
+        let gui = game.join("game").join("gui");
+        std::fs::create_dir_all(&gui).unwrap();
+        let (w, h) = (240, 40);
+        let mut px = vec![0x0010_1010u32; w * h];
+        for x0 in [30, 150] {
+            (14..26).flat_map(|y| (x0..x0 + 30).map(move |x| y * w + x)).for_each(|i| px[i] = 0x00ff_ffff);
+        }
+        std::fs::write(gui.join("picker.png"), write_png(&Image { w, h, px }).unwrap()).unwrap();
+        // each label is read twice: the first plainly, the second two ways
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let model = crate::llm::tests::Fake(|p: &str| {
+            if p == *READ_PROMPT {
+                return Ok(["彩度", "彩度", "移園", "彩思"][reads.fetch_add(1, Ordering::Relaxed) % 4].to_string());
+            }
+            if p.contains("Two readings") {
+                return Ok(if p.contains("1: 彩度") { "1" } else { "2" }.to_string());
+            }
+            Ok("1: Saturation".to_string())
+        });
+        translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
+        let kept: IndexMap<String, Vec<String>> = load_json(&game.join("vntl_work").join("image_reads.json")).unwrap();
+        assert_eq!(kept.values().cloned().collect::<Vec<_>>(), [vec!["彩度".to_string()], vec!["彩度".to_string()]]);
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn a_reading_has_to_fit_its_block() {
+        let block = |w: usize, h: usize| Block { x0: 0, y0: 0, x1: w, y1: h, mask: vec![true; w * h], group: 0 };
+        assert!(!fits(&block(14, 24), "システム"), "a note shape read as a word");
+        assert!(fits(&block(14, 24), "済"));
+        assert!(fits(&block(61, 41), "ページ3"), "a label with English under it is tall for its letters");
+        assert!(fits(&block(20, 100), "セーブする"), "a label running down");
+        assert!(fits(&block(335, 35), "右クリックでシステム画面に切り替える"));
+    }
+
+    #[test]
+    fn a_long_reading_a_letter_off_another_on_the_screen_takes_the_real_word() {
+        let game = std::env::temp_dir().join(format!("vntl_settle_far_{}", std::process::id()));
+        let gui = game.join("game").join("gui");
+        std::fs::create_dir_all(&gui).unwrap();
+        // a title in the list, and the same title in a pop-up's letters, not alike enough to group
+        for (name, wide) in [("a_list.png", 60), ("b_popup.png", 90)] {
+            let (w, h) = (200, 40);
+            let mut px = vec![0x0010_1010u32; w * h];
+            (14..26).flat_map(|y| (40..40 + wide).map(move |x| y * w + x)).for_each(|i| px[i] = 0x00ff_ffff);
+            std::fs::write(gui.join(name), write_png(&Image { w, h, px }).unwrap()).unwrap();
+        }
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let model = crate::llm::tests::Fake(|p: &str| {
+            if p == *READ_PROMPT {
+                return Ok(["星降る夜に", "星降る夜に", "星降る夏に", "星降る夏に"][reads.fetch_add(1, Ordering::Relaxed) % 4].to_string());
+            }
+            // the picture can't tell, the first shown being taken either way round; the words can
+            if p.contains("Compare each letter") {
+                return Ok("1".to_string());
+            }
+            if p.contains("as a game menu would write it") {
+                return Ok(if p.contains("1: 星降る夜") { "1" } else { "2" }.to_string());
+            }
+            Ok("1: On a Starry Night".to_string())
+        });
+        translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
+        let kept: IndexMap<String, Vec<String>> = load_json(&game.join("vntl_work").join("image_reads.json")).unwrap();
+        assert_eq!(kept.values().cloned().collect::<Vec<_>>(), [vec!["星降る夜に".to_string()], vec!["星降る夜に".to_string()]]);
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn a_reading_stays_with_its_label_when_another_is_found_before_it() {
+        let game = std::env::temp_dir().join(format!("vntl_read_keys_{}", std::process::id()));
+        let gui = game.join("game").join("gui");
+        std::fs::create_dir_all(&gui).unwrap();
+        let bars = |at: &[usize]| {
+            let (w, h) = (240, 40);
+            let mut px = vec![0x0010_1010u32; w * h];
+            for &x0 in at {
+                (14..26).flat_map(|y| (x0..x0 + 30).map(move |x| y * w + x)).for_each(|i| px[i] = 0x00ff_ffff);
+            }
+            write_png(&Image { w, h, px }).unwrap()
+        };
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let model = crate::llm::tests::Fake(|p: &str| {
+            if p == *READ_PROMPT {
+                reads.fetch_add(1, Ordering::Relaxed);
+                return Ok("注意".to_string());
+            }
+            Ok("1: Notice".to_string())
+        });
+        let run = |at: &[usize]| {
+            std::fs::write(gui.join("bar.png"), bars(at)).unwrap();
+            translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
+            reads.load(Ordering::Relaxed)
+        };
+        let one = run(&[150]);
+        assert_eq!(run(&[30, 150]), 2 * one, "only the new label is read");
+        run(&[30]);
+        let kept: IndexMap<String, Vec<String>> = load_json(&game.join("vntl_work").join("image_reads.json")).unwrap();
+        assert_eq!(kept.len(), 1, "and what no longer has a label goes: {kept:?}");
         std::fs::remove_dir_all(&game).unwrap();
     }
 

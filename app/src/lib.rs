@@ -9,6 +9,7 @@
 
 pub mod advhd;
 pub mod artemis;
+pub mod avif;
 pub mod bgi;
 pub mod blowfish;
 pub mod catsystem;

@@ -43,7 +43,7 @@
 - **Gets names right.** Give it a list of characters and genders, and the model gets their names and pronouns.
 - **Works out genders.** With an image model picked, it fills in any gender you left blank.
 - **Fits text to the box.** Show it a screenshot of a long line and it measures the game's message box, then rewraps everything to match.
-- **Repaints menu images.** It reads the text in buttons and menus, and paints the English in.
+- **Repaints menu images.** It reads the text in buttons and menus, and paints the English in. Labels that already show English stay as they are.
 - **Uses what already exists.** On Ren'Py, lines from an official translation are copied instead of translated again.
 - **Shows its work.** Watch the Japanese and English arrive, or switch **SHOW LINES** off.
 - **Shows what it's using.** The Model tab shows VRAM, RAM and CPU use, live.

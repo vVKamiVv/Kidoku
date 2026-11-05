@@ -472,9 +472,9 @@ fn read_usage(ui: &AppWindow, sampler: Arc<Mutex<Sampler>>) {
 }
 
 /// The image model, reading pictures with the menu reading model when there is one. Either alone
-/// does both.
+/// does both. At no temperature, a label read the same gets the same English every run.
 fn vision_chat(url: &str, vision: &str, reading: &str) -> Option<Box<dyn Chat + Send>> {
-    let server = |m: &str| Server::new(url, m, 0.2, 600);
+    let server = |m: &str| Server::new(url, m, 0.0, 600);
     match (vision, reading) {
         ("", "") => None,
         (v, "") => Some(Box::new(server(v))),

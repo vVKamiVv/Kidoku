@@ -1,5 +1,7 @@
 //! Filling in where text sat over a picture, with LaMa: a model that continues what's around a hole,
 //! patterns and edges too, where the plain fill in menus.rs can only smear the edge colours inwards.
+//! This one was trained further on anime and manga pictures (dreMaz/AnimeMangaInpainting), which on a
+//! game's title art filled holes 8% closer to what was there than LaMa trained on photos.
 //! It runs on the CPU through tract, takes a 512×512 window, and downloads once, on request.
 
 use crate::liar::Image;
@@ -11,10 +13,12 @@ use tract_onnx::prelude::*;
 
 /// File, address and exact size, at a fixed version.
 const MODEL: (&str, &str, u64) = (
-    "lama_fp32.onnx",
-    "https://huggingface.co/Carve/LaMa-ONNX/resolve/c3c0c9e468934d62e79c329e35d82dd09ff8c444/lama_fp32.onnx",
-    208_044_816,
+    "lama-manga.onnx",
+    "https://huggingface.co/mayocream/lama-manga-onnx/resolve/b55497aadbfcb9740e1ed16f008268d71b4f3f79/lama-manga.onnx",
+    207_482_644,
 );
+/// The photo-trained LaMa 0.1.6 and 0.1.7 downloaded, which the new one replaces.
+const OLD_MODEL: &str = "lama_fp32.onnx";
 const SIDE: usize = 512;
 /// A hole this much wider than the row the reader found: lettering has a dark edge or a glow past
 /// it, and what's left the model grows back into letters. 12 cleared a real tutorial screen; 3 didn't.
@@ -37,7 +41,10 @@ pub fn installed() -> bool {
 }
 
 pub fn download(progress: &dyn Fn(u64, u64)) -> R<()> {
-    crate::download_files(&folder(), &models(), progress)
+    crate::download_files(&folder(), &models(), progress)?;
+    // 208 MB nothing uses any more
+    let _ = std::fs::remove_file(folder().join(OLD_MODEL));
+    Ok(())
 }
 
 /// The rows grown by the margin, within the picture, and cut to fit a window.
@@ -119,7 +126,8 @@ impl Painter {
                     }
                     let old = img.px[y * w + x];
                     let mix = |c: usize| {
-                        let new = out[[0, c, y - wy, x - wx]].clamp(0.0, 255.0);
+                        // the model gives 0 to 1
+                        let new = (out[[0, c, y - wy, x - wx]] * 255.0).clamp(0.0, 255.0);
                         (new * s + (old >> (16 - 8 * c) & 255) as f32 * (1.0 - s)).round() as u32
                     };
                     img.px[y * w + x] = (old & 0xff00_0000) | mix(0) << 16 | mix(1) << 8 | mix(2);

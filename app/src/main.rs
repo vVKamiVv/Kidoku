@@ -174,7 +174,7 @@ fn run(cli: Cli) -> vntl::R<()> {
         }
         Command::Translate { label, file, lang, url, model, batch, temperature, timeout, reference, ui, redump, retranslate, fresh, vision_model, reading_model, no_images, art, history, .. } => {
             let chat = Server::new(&url, &model, temperature, timeout);
-            let server = |m: &str| Server::new(&url, m, 0.2, timeout);
+            let server = |m: &str| Server::new(&url, m, 0.0, timeout);
             let vision = match (vision_model, reading_model) {
                 (Some(v), Some(r)) if v != r => Some(Box::new(Pair { reads: server(&r), words: server(&v) }) as Box<dyn Chat + Send>),
                 (v, r) => v.or(r).map(|m| Box::new(server(&m)) as Box<dyn Chat + Send>),
