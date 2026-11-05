@@ -44,6 +44,7 @@
 - **Works out genders.** With an image model picked, it fills in any gender you left blank.
 - **Fits text to the box.** Show it a screenshot of a long line and it measures the game's message box, then rewraps everything to match.
 - **Repaints menu images.** It reads the text in buttons and menus, and paints the English in. Labels that already show English stay as they are.
+- **Checks the menus' English.** With a menu reading model picked, the story's model reads each label too, and English it shows to be wrong is corrected and remembered for every game.
 - **Uses what already exists.** On Ren'Py, lines from an official translation are copied instead of translated again.
 - **Shows its work.** Watch the Japanese and English arrive, or switch **SHOW LINES** off.
 - **Shows what it's using.** The Model tab shows VRAM, RAM and CPU use, live.
@@ -139,7 +140,21 @@ Memory is how many earlier lines the model sees. More reads better and runs a li
 
 <sub>Measured with the VN model on an RTX 3060 Ti 8 GB with other programs using the card. A free card went about twice as fast. Your speed will depend on your GPU and the game's text.</sub>
 
-## `>>5` Command line
+## `>>5` Keeping the models on track
+
+Local models slip in ways you can predict, so Kidoku asks its questions in ways that catch them:
+
+| A model… | So Kidoku… |
+|---|---|
+| leans to the first of two answers it's shown | asks every either-or question both ways round, and acts only when both agree |
+| mixes up letters that look alike, as パ and バ, テ and デ, ノ and / | lets the words decide which is real Japanese, since the picture can't |
+| reads a shape or English as Japanese | asks plainly whether the picture holds Japanese, and drops a reading too long for its space |
+| can be sure of a wrong meaning | has the story model translate the label too, and a third model judge between them |
+| answers differently with other labels beside it | checks each label on its own |
+
+Corrections it makes are remembered for every game. The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/How-Kidoku-handles-the-models) has more.
+
+## `>>6` Command line
 
 Everything the window does also works from a terminal, with `vntl.exe`.
 
@@ -182,19 +197,20 @@ vntl write <game>
 
 </details>
 
-## `>>6` Your files
+## `>>7` Your files
 
 | Where | What's there |
 |---|---|
 | `vntl_work/` in the game folder | Saved progress and `characters.txt` |
 | `vntl_work/box.txt` | The measured message box, in letters and rows, if you used **Fit text to the box** |
 | `*.vntl-orig` next to a changed file | The original, untouched |
+| `%APPDATA%\VN Translator\label_memory.txt` | Menu English the app corrected, used again in every game |
 
 **Remove translation** puts the originals back and keeps your progress. If a game update changed a file, the new file stays.
 
 This repo holds no game files. Please use the app on games you own.
 
-## `>>7` License
+## `>>8` License
 
 Kidoku is free software under the [GNU General Public License, version 3](LICENSE). The window is made with [Slint](https://slint.dev), used under the same license.
 

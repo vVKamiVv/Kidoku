@@ -29,6 +29,41 @@ pub trait Chat: Sync {
     fn model(&self) -> &str {
         ""
     }
+    /// The story's own model, beside an image model: it checks the menus' English.
+    fn story(&self) -> Option<&dyn Chat> {
+        None
+    }
+    /// The menu reading model, when it isn't the one writing the English.
+    fn reader(&self) -> Option<&dyn Chat> {
+        None
+    }
+}
+
+/// An image model with the story's model beside it, when they're two.
+pub struct Checked<'a> {
+    pub vision: &'a dyn Chat,
+    pub story: &'a dyn Chat,
+}
+
+impl Chat for Checked<'_> {
+    fn chat(&self, system: &str, user: &str) -> R<String> {
+        self.vision.chat(system, user)
+    }
+    fn complete(&self, prompt: &str, temperature: f64) -> R<String> {
+        self.vision.complete(prompt, temperature)
+    }
+    fn read_image(&self, png: &[u8], prompt: &str) -> R<String> {
+        self.vision.read_image(png, prompt)
+    }
+    fn model(&self) -> &str {
+        self.vision.model()
+    }
+    fn story(&self) -> Option<&dyn Chat> {
+        (self.story.model() != self.vision.model()).then_some(self.story)
+    }
+    fn reader(&self) -> Option<&dyn Chat> {
+        self.vision.reader()
+    }
 }
 
 pub struct Server {
@@ -289,6 +324,9 @@ impl<A: Chat, B: Chat> Chat for Pair<A, B> {
     }
     fn model(&self) -> &str {
         self.words.model()
+    }
+    fn reader(&self) -> Option<&dyn Chat> {
+        Some(&self.reads)
     }
 }
 

@@ -33,6 +33,12 @@ static READ_PROMPT: LazyLock<String> = LazyLock::new(|| format!(
 ));
 const LABELS_HELP: &str = "# Text read from the game's menu images and its English, one per line: readings = English
 # Change the English to correct a label, then run the translation again. Lines starting with # are ignored.
+# A label ending [short] is the English used where the full one doesn't fit.
+";
+/// What marks a label's short English in image_labels.txt.
+const SHORT: &str = " [short]";
+const MEMORY_HELP: &str = "# Menu labels whose English the story's model corrected, in any game: readings = English
+# Used again wherever a label reads the same, and shown to the model as examples. Lines starting with # are ignored.
 ";
 // shortcut: where Liar-soft games keep menus in the two games' worth of evidence we have; scan every
 // archive once a game keeps them elsewhere (the flat-background test already protects artwork).
@@ -468,6 +474,22 @@ fn nearest(words: &[Vec<char>], reading: &str) -> Option<String> {
     best.filter(|b| b.0 > 0).map(|b| b.1.iter().collect())
 }
 
+/// Of two readings, the one the words model calls real Japanese asked of each on its own, when it
+/// calls the other not: a model that takes the first of two either way round still knows
+/// ハッピーテイ is no word. It calls a misreading real more often than that, so this is only for
+/// readings a voicing mark apart.
+fn real_of_two(vision: &dyn Chat, a: &str, b: &str) -> R<Option<String>> {
+    let real = |t: &str| -> R<bool> {
+        let prompt = format!("A label from a Japanese game's menus was read as: {t}\nIs that real Japanese, as a game would write it, with no letter misread? Reply YES or NO.");
+        Ok(vision.chat("", &prompt)?.trim_start().to_uppercase().starts_with("YES"))
+    };
+    Ok(match (real(a)?, real(b)?) {
+        (true, false) => Some(a.to_string()),
+        (false, true) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
 /// Which of two readings is real Japanese, asked without the picture but with the labels read
 /// beside it, both ways round as `choose` asks. None if the model can't tell.
 fn likelier(vision: &dyn Chat, a: &str, b: &str, beside: &[String]) -> R<Option<String>> {
@@ -722,8 +744,12 @@ fn load_labels(path: &Path) -> R<IndexMap<String, String>> {
 }
 
 fn save_labels(path: &Path, labels: &IndexMap<String, String>) -> R<()> {
+    write_labels(path, LABELS_HELP, labels)
+}
+
+fn write_labels(path: &Path, help: &str, labels: &IndexMap<String, String>) -> R<()> {
     let body: String = labels.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
-    crate::write_whole(path, format!("{LABELS_HELP}{body}").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    crate::write_whole(path, format!("{help}{body}").as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A label that is a character's name, or names together, in the story's English spelling.
@@ -758,7 +784,41 @@ fn paintable(reply: &str, reading: &str) -> Option<String> {
         }
         None => first,
     };
-    (!first.is_empty() && !JA.is_match(first) && has(['(', '（']) && has(['[', '［'])).then(|| first.to_string())
+    // a label with no accented letters has none in its English either, as a model writes "Harém"
+    let accented = |c: char| ('À'..='ÿ').contains(&c) && c != '×' && c != '÷';
+    let plain = |c: char| match c {
+        'à'..='å' => 'a', 'è'..='ë' => 'e', 'ì'..='ï' => 'i', 'ò'..='ö' => 'o', 'ù'..='ü' => 'u', 'ç' => 'c', 'ñ' => 'n', 'ý' | 'ÿ' => 'y',
+        'À'..='Å' => 'A', 'È'..='Ë' => 'E', 'Ì'..='Ï' => 'I', 'Ò'..='Ö' => 'O', 'Ù'..='Ü' => 'U', 'Ç' => 'C', 'Ñ' => 'N', 'Ý' => 'Y',
+        c => c,
+    };
+    let first: String = if reading.chars().any(accented) { first.to_string() } else { first.chars().map(plain).collect() };
+    // nor a full stop the label lacks, as a sentence ends: "Move painting left."
+    let first = if !first.ends_with("..") && !reading.ends_with(['。', '.']) { first.trim_end_matches('.').to_string() } else { first };
+    (!first.is_empty() && !JA.is_match(&first) && has(['(', '（']) && has(['[', '［'])).then_some(first)
+}
+
+/// A reading with its letters' voicing marks taken off, as ハッピーデイ to ハッピーテイ.
+fn unvoiced(reading: &str) -> String {
+    const VOICED: &str = "がぎぐげござじずぜぞだぢづでどばびぶべぼぱぴぷぺぽガギグゲゴザジズゼゾダヂヅデドバビブベボパピプペポヴ";
+    const PLAIN: &str = "かきくけこさしすせそたちつてとはひふへほはひふへほカキクケコサシスセソタチツテトハヒフヘホハヒフヘホウ";
+    reading.chars().map(|c| VOICED.chars().position(|v| v == c).and_then(|i| PLAIN.chars().nth(i)).unwrap_or(c)).collect()
+}
+
+/// Readings a letter away by a pair an image model mixes up in menu lettering: the round mark and the
+/// two strokes, as パ and バ, and ノ for a slash after Japanese.
+fn look_alikes(reading: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 10] = [('バ', 'パ'), ('ビ', 'ピ'), ('ブ', 'プ'), ('ベ', 'ペ'), ('ボ', 'ポ'), ('ば', 'ぱ'), ('び', 'ぴ'), ('ぶ', 'ぷ'), ('べ', 'ぺ'), ('ぼ', 'ぽ')];
+    let chars: Vec<char> = reading.chars().collect();
+    (0..chars.len()).filter_map(|i| {
+        let after_japanese = i > 0 && JA.is_match(&chars[i - 1].to_string());
+        let other = match chars[i] {
+            '/' if after_japanese => 'ノ',
+            c => PAIRS.iter().find_map(|&(a, b)| if c == a { Some(b) } else if c == b { Some(a) } else { None })?,
+        };
+        let mut v = chars.clone();
+        v[i] = other;
+        Some(v.into_iter().collect())
+    }).collect()
 }
 
 /// Whether a reading could be drawn in its block: in one taller than wide, letters down a column at
@@ -791,21 +851,50 @@ fn batches(pictures: &[&str]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// Translate some of a screen's labels together: each gives the others context, and the readings
-/// of one label correct each other. None if the reply can't be read.
-fn translate_screen(vision: &dyn Chat, keys: &[(String, usize, String)]) -> R<Option<Vec<String>>> {
+/// of one label correct each other. `note` says more about them. None if the reply can't be read.
+fn translate_screen(vision: &dyn Chat, keys: &[(String, usize, String)], note: &str) -> R<Option<Vec<String>>> {
     let list: Vec<String> = keys.iter().enumerate().map(|(i, (k, n, hint))| format!("{}: {k} ({hint}at most {n} characters)", i + 1)).collect();
     let prompt = format!(
         "These labels come from one screen of a Japanese game's interface, read by OCR, so they may have mistakes. Where a label has \
          several readings they are separated by ' / ' and are the same label: work out the real Japanese word from them and from the \
          other labels. They are the titles, buttons and settings of a game's menus, not its story. Translate each one into the \
          concise English a game menu would show for it, within its character limit: only the label's own words, nothing added to \
-         explain it. A reading that is no real word is a word misread by a letter or two: translate that word. \
+         explain it. Translate all of a label's words: a long one, as a line of credits, stays whole. \
+         A reading that is no real word is a word misread by a letter or two: translate that word. \
          A name stays that name, in English letters. A letter and a dot before a word shorten another word, as Q. for Quick and A. for Auto. \
-         Reply with exactly {n} lines formatted '<number>: <English>' and nothing else.\n\n{}",
+         {note}Reply with exactly {n} lines formatted '<number>: <English>' and nothing else.\n\n{}",
         list.join("\n"),
         n = keys.len()
     );
     Ok(parse_numbered(&vision.chat("", &prompt)?, keys.len()))
+}
+
+/// Whether `judge` takes `new` over `old` as the English of the label `jp`, asked both ways round:
+/// a model leans to the first it's shown.
+fn better(judge: &dyn Chat, jp: &str, old: &str, new: &str) -> R<bool> {
+    let pick = |first: &str, second: &str| -> R<Option<bool>> {
+        // asked as a menu shows it: on the button that quits the game, "Game Over" doesn't say what it does
+        let prompt = format!(
+            "A Japanese game's menu shows this label or button: {jp}\nTwo English versions of it:\n1: {first}\n2: {second}\n\
+             Which is right on that menu: says what the label means, or what the button does, and all of it? Reply with only its number."
+        );
+        Ok(match judge.chat("", &prompt)?.trim_start().chars().next() {
+            Some('1') => Some(first == new),
+            Some('2') => Some(second == new),
+            _ => None,
+        })
+    };
+    Ok(pick(old, new)? == Some(true) && pick(new, old)? == Some(true))
+}
+
+/// How the story's model reads a label: a VNTL model in its own prompt, any other asked plainly.
+fn story_english(story: &dyn Chat, jp: &str) -> R<Option<String>> {
+    if crate::llm::is_vntl(story.model()) {
+        // labels hold no markup to keep
+        static NO_MARKUP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"[^\s\S]").unwrap());
+        return crate::llm::translate_vntl(story, &NO_MARKUP, &[], &[], None, jp);
+    }
+    Ok(Some(story.chat("", &format!("Translate this label from a Japanese game into English. Reply with the English only.\n\n{jp}"))?.trim().to_string()))
 }
 
 fn bold_font() -> R<Font> {
@@ -935,6 +1024,9 @@ struct Job<'a> {
     people: Vec<Vec<char>>,
     /// What the labels already read on the picture being read say
     nearby: Vec<String>,
+    /// English the story's model corrected, in any game: used again, and shown as examples
+    memory: IndexMap<String, String>,
+    memory_path: PathBuf,
 }
 
 impl<'a> Job<'a> {
@@ -947,7 +1039,9 @@ impl<'a> Job<'a> {
         let font = bold_font()?;
         // tests draw their own fixtures and answer for the model, whatever this PC has installed
         let reader = if cfg!(test) { None } else { Reader::open().ok() };
-        Ok(Job { game: game.to_path_buf(), matched: false, vision, reader, reader_only: false, vision_first: false, report, cancel, reads_path, labels_path, cached, labels, font, read_before: HashMap::new(), names: &|_| None, words: Vec::new(), people: Vec::new(), nearby: Vec::new() })
+        let memory_path = if cfg!(test) { work.join("label_memory.txt") } else { crate::app_folder("label_memory.txt") };
+        let memory = if memory_path.exists() { load_labels(&memory_path)? } else { IndexMap::new() };
+        Ok(Job { game: game.to_path_buf(), matched: false, vision, reader, reader_only: false, vision_first: false, report, cancel, reads_path, labels_path, cached, labels, font, read_before: HashMap::new(), names: &|_| None, words: Vec::new(), people: Vec::new(), nearby: Vec::new(), memory, memory_path })
     }
 
     /// The text reader's reading, or the image model's if it saw nothing, the label runs down, or
@@ -1084,14 +1178,15 @@ impl<'a> Job<'a> {
             if stopped() {
                 return Err("Stopped".into());
             }
-            let mut english = translate_screen(self.vision, chunk)?.unwrap_or_default();
+            let note = self.remembered(chunk);
+            let mut english = translate_screen(self.vision, chunk, &note)?.unwrap_or_default();
             if english.is_empty() {
                 // one label at a time, as translate_batch retries a line
                 for label in chunk {
                     if stopped() {
                         return Err("Stopped".into());
                     }
-                    english.push(translate_screen(self.vision, std::slice::from_ref(label))?.unwrap_or_default().concat());
+                    english.push(translate_screen(self.vision, std::slice::from_ref(label), &note)?.unwrap_or_default().concat());
                 }
             }
             let good: Vec<(String, String)> = chunk.iter().zip(&english).filter_map(|((k, _, _), e)| Some((k.clone(), paintable(e, k)?))).collect();
@@ -1103,6 +1198,76 @@ impl<'a> Job<'a> {
             (self.report)(Event::Log(format!("{missed} labels in {screen} stay in Japanese; run again to retry them.")));
         }
         Ok(())
+    }
+
+    /// Corrections made before, in this game or another, sharing letters with `labels`: the model is
+    /// shown them, to go by.
+    fn remembered(&self, labels: &[(String, usize, String)]) -> String {
+        let shares = |a: &str, b: &str| a.chars().collect::<Vec<_>>().windows(2).any(|w| b.contains(&w.iter().collect::<String>()));
+        let found: Vec<String> = self.memory.iter().filter(|(k, _)| labels.iter().any(|(l, ..)| shares(k, l))).take(8).map(|(k, e)| format!("{k} = {e}")).collect();
+        if found.is_empty() { String::new() } else { format!("Corrections made to earlier labels, to go by: {}. ", found.join("; ")) }
+    }
+
+    /// This run's English checked against the story's own model, trained on visual novels, which
+    /// knows phrases an image model can get wrong, as ご機嫌な, cheerful, read as grumpy. Where the
+    /// menu reading model, a third, takes the story model's reading over the English, the label is
+    /// translated again with that reading shown, and the new English kept if the third model takes
+    /// it too: in the labels, and in the memory, for every game. The story model slips as well, as
+    /// "Game Over" for the button that quits the game, so without a third model to judge, nothing changes.
+    fn check_with_story(&mut self, todo: &[(String, usize, String)]) -> R<()> {
+        let (Some(story), Some(judge)) = (self.vision.story(), self.vision.reader()) else { return Ok(()) };
+        let stopped = || if self.cancel.load(Ordering::Relaxed) { Err("Stopped".to_string()) } else { Ok(()) };
+        // one model at a time, in turns, as two may not fit in the graphics memory together. Each
+        // label once, and not one read several ways, whose first reading may be the wrong one
+        let mut once = BTreeSet::new();
+        let mut read = Vec::new();
+        for t in todo.iter().filter(|t| !t.0.contains(BOTH) && once.insert(&t.0)) {
+            stopped()?;
+            let Some(en) = self.labels.get(&t.0).cloned() else { continue };
+            if let Some(s) = story_english(story, &t.0)?.filter(|s| !s.is_empty() && *s != en) {
+                read.push((t, en, s));
+            }
+        }
+        // the menu reading model judges, each label on its own: the words model saw no contradiction
+        // between "grumpy" and "cheerful" asked of the pair alone, and changed its verdicts with the
+        // labels listed beside them
+        let mut flagged = Vec::new();
+        for (t, en, s) in read {
+            stopped()?;
+            if better(judge, &t.0, &en, &s)? {
+                flagged.push((t, en, s));
+            }
+        }
+        // the story model's reading put as a menu has it, in English alone: shown the Japanese, the words
+        // model went back to what it believes the phrase means. Each on its own, as few are
+        let mut redone = Vec::new();
+        for ((k, n, _), old, s) in &flagged {
+            stopped()?;
+            let prompt = format!(
+                "This is how a translator read a label from a Japanese game's menus: \"{s}\"\nWrite it as the concise English a \
+                 game menu would show, at most {n} characters, keeping all it says. Reply with the English only."
+            );
+            if let Some(new) = paintable(&self.vision.chat("", &prompt)?, k) {
+                redone.push((k, old, new));
+            }
+        }
+        let mut taken = 0;
+        for (k, old, new) in redone {
+            stopped()?;
+            if new != *old && better(judge, k, old, &new)? {
+                self.labels.insert(k.clone(), new.clone());
+                self.memory.insert(k.clone(), new);
+                taken += 1;
+            }
+        }
+        if taken > 0 {
+            (self.report)(Event::Log(format!("{taken} labels' English corrected against the story's model.")));
+            if let Some(dir) = self.memory_path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            write_labels(&self.memory_path, MEMORY_HELP, &self.memory)?;
+        }
+        save_labels(&self.labels_path, &self.labels)
     }
 
     /// Labels on one picture that read differently but got the same English, as 停止 and 一時停止 both
@@ -1157,7 +1322,8 @@ impl<'a> Job<'a> {
         save_labels(&self.labels_path, &self.labels)
     }
 
-    /// Ask for shorter English for the labels in `long`, each to fit the characters given.
+    /// Ask for shorter English for the labels in `long`, each to fit the characters given, kept beside
+    /// the full English for the places it doesn't fit.
     fn shorten_labels(&mut self, long: &IndexMap<String, usize>) -> R<()> {
         let list: Vec<(&String, String, usize)> = long.iter().filter_map(|(k, n)| Some((k, self.labels.get(k)?.clone(), *n))).collect();
         for chunk in list.chunks(20) {
@@ -1175,7 +1341,7 @@ impl<'a> Job<'a> {
             let Some(short) = parse_numbered(&self.vision.chat("", &prompt)?, chunk.len()) else { continue };
             for ((k, en, _), s) in chunk.iter().zip(short) {
                 if let Some(s) = paintable(&s, k).filter(|s| s.chars().count() < en.chars().count()) {
-                    self.labels.insert(k.to_string(), s);
+                    self.labels.insert(format!("{k}{SHORT}"), s);
                 }
             }
         }
@@ -1305,7 +1471,7 @@ impl<'a> Job<'a> {
         // 星降る夏に, beside a list of songs that has 星降る夜に plainly. Those go first:
         // a label read several ways, one of which another label was read as alone, is that word
         fresh.sort_by_key(|&i| groups[i].reads.len() != 1);
-        for i in fresh {
+        for &i in &fresh {
             let entry = parts[groups[i].first.0].entry;
             // what the others were read as, less this label's own readings, which tell nothing
             let others = |here: bool| -> Vec<Vec<char>> {
@@ -1331,16 +1497,41 @@ impl<'a> Job<'a> {
             let (a, b) = groups[i].first;
             let block = &parts[a].blocks[b];
             let png = write_png(&block_image(&parts[a], block, 4.max(72 / (block.y1 - block.y0).max(1))))?;
-            let picked = choose(self.vision, &png, &word, &reading)?;
+            // the marks that voice a letter, as テ and デ, are too small for the picture to settle in
+            // decorative lettering: there the words do
+            let marks_only = unvoiced(&word) == unvoiced(&reading);
+            let picked = if marks_only { None } else { choose(self.vision, &png, &word, &reading)? };
             let take = match (groups[i].reads.len(), picked) {
                 (1, Some(p)) => p == word,
-                (1, None) => likelier(self.vision, &word, &reading, &[])?.as_deref() == Some(word.as_str()),
+                (1, None) => {
+                    let pick = match likelier(self.vision, &word, &reading, &[])? {
+                        None if marks_only => real_of_two(self.vision, &word, &reading)?,
+                        pick => pick,
+                    };
+                    pick.as_deref() == Some(word.as_str())
+                }
                 (_, picked) => picked.as_deref() != Some(reading.as_str()),
             };
             if take {
                 groups[i].reads = vec![word];
                 self.cached.insert(groups[i].key.clone(), groups[i].reads.clone());
                 save_json(&self.reads_path, &self.cached)?;
+            }
+        }
+        // letters the picture can't tell apart, as バ and パ or ノ and a slash, go by which makes real
+        // Japanese beside the picture's other labels: a title read バイをやいた is パイをやいた
+        for &i in &fresh {
+            let [reading] = &groups[i].reads[..] else { continue };
+            let reading = reading.clone();
+            let entry = parts[groups[i].first.0].entry;
+            let beside: Vec<String> = groups.iter().filter(|o| o.reads.len() == 1 && o.reads[0] != reading && parts[o.first.0].entry == entry).map(|o| o.reads[0].clone()).take(12).collect();
+            for other in look_alikes(&reading) {
+                if likelier(self.vision, &reading, &other, &beside)?.as_deref() == Some(other.as_str()) {
+                    groups[i].reads = vec![other];
+                    self.cached.insert(groups[i].key.clone(), groups[i].reads.clone());
+                    save_json(&self.reads_path, &self.cached)?;
+                    break;
+                }
             }
         }
         for (c, d, key) in split {
@@ -1357,7 +1548,11 @@ impl<'a> Job<'a> {
         }
 
         let key = |g: &Group| g.reads.join(BOTH);
-        let room = |g: &Group| (parts[g.first.0].img.w.min(320) / 11).max(4);
+        // what the picture's width allows, or a long label's own, as a line of credits
+        let room = |g: &Group| {
+            let (p, b) = (&parts[g.first.0], &parts[g.first.0].blocks[g.first.1]);
+            (p.img.w.min(320).max(b.x1 - b.x0) / 11).max(4)
+        };
         // what a button is for: the leftmost label on its row is the setting it belongs to
         let hint = |g: &Group| -> String {
             let part = &parts[g.first.0];
@@ -1380,36 +1575,54 @@ impl<'a> Job<'a> {
                 self.labels.entry(key(g)).or_insert(en);
             }
         }
+        // and one corrected before, in this game or another, keeps its correction
+        for g in groups.iter().filter(|g| !g.reads.is_empty()) {
+            if let Some(en) = self.memory.get(&key(g)) {
+                self.labels.entry(key(g)).or_insert(en.clone());
+            }
+        }
         let new: Vec<&Group> = groups.iter().filter(|g| !g.reads.is_empty() && !self.labels.contains_key(&key(g))).collect();
         let todo: Vec<(String, usize, String)> = new.iter().map(|g| (key(g), room(g), hint(g))).collect();
         let pictures: Vec<&str> = new.iter().map(|g| parts[g.first.0].name.as_str()).collect();
         self.translate_labels(screen, &todo, &pictures)?;
+        self.check_with_story(&todo)?;
         self.tell_apart(parts, &groups, &todo)?;
         let samples: Vec<Sample> = groups.iter().filter(|g| !g.reads.is_empty()).take(SAMPLES).map(|g| sample(&parts[g.first.0].blocks[g.first.1], &g.reads[0])).collect();
         if !self.matched && !samples.is_empty() {
             self.font = matched_font(&self.game, "menus", &samples)?;
             self.matched = true;
         }
-        // English too wide for its place even drawn small runs off it. Only this run's: a label the
-        // user corrected stays as they wrote it
+        // English too wide for its place even drawn small runs off it, so it gets a short form there.
+        // Only this run's: a label the user corrected stays as they wrote it
+        let sps: Vec<_> = parts.iter().map(|p| spans(&p.img, p.bg)).collect();
+        // how many letters fit, if the English doesn't
+        let too_wide = |font: &Font, p: &Part, text: &[Option<&String>], sp: &[Option<(usize, usize)>], b: &Block, t: &str| {
+            let (wide, room) = (text_width(font, t, SMALLEST) + 4.0, place(p, text, sp, b).2 as f32);
+            (wide > room).then(|| ((t.chars().count() as f32 * room / wide) as usize).max(3))
+        };
         let mut long: IndexMap<String, usize> = IndexMap::new();
-        for p in parts.iter() {
+        for (p, sp) in parts.iter().zip(&sps) {
             let text: Vec<Option<&String>> = p.blocks.iter().map(|b| self.labels.get(&key(&groups[b.group]))).collect();
-            let sp = spans(&p.img, p.bg);
             for (b, t) in p.blocks.iter().zip(&text) {
                 let k = key(&groups[b.group]);
                 let Some(t) = t.filter(|_| todo.iter().any(|(d, _, _)| *d == k)) else { continue };
-                let (wide, room) = (text_width(&self.font, t, SMALLEST) + 4.0, place(p, &text, &sp, b).2 as f32);
-                if wide > room {
-                    let most = ((t.chars().count() as f32 * room / wide) as usize).max(3);
+                if let Some(most) = too_wide(&self.font, p, &text, sp, b, t) {
                     long.entry(k).and_modify(|n| *n = (*n).min(most)).or_insert(most);
                 }
             }
         }
         self.shorten_labels(&long)?;
         let mut changed = Vec::new();
-        for (i, p) in parts.iter().enumerate() {
-            let text: Vec<Option<&String>> = p.blocks.iter().map(|b| self.labels.get(&key(&groups[b.group]))).collect();
+        for (i, (p, sp)) in parts.iter().zip(&sps).enumerate() {
+            let full: Vec<Option<&String>> = p.blocks.iter().map(|b| self.labels.get(&key(&groups[b.group]))).collect();
+            // the short form only where the full English doesn't fit: a word in a small place and a large one
+            let text: Vec<Option<&String>> = p.blocks.iter().zip(&full).map(|(b, t)| {
+                let short = self.labels.get(&format!("{}{SHORT}", key(&groups[b.group])));
+                match (t, short) {
+                    (Some(t), Some(s)) if too_wide(&self.font, p, &full, sp, b, t).is_some() => Some(s),
+                    _ => *t,
+                }
+            }).collect();
             if text.iter().any(|t| t.is_some()) {
                 changed.push((i, repaint(p, &text, &self.font)?));
             }
@@ -2382,6 +2595,10 @@ mod tests {
         assert_eq!(paintable("Bike Back (likely \"B-back\")", "バイクバック"), None);
         assert_eq!(paintable("Load Complete (Load)", "ロード完了しました").as_deref(), Some("Load Complete"));
         assert_eq!(paintable("Scene Viewing (View)", "シーン鑑賞モード中です").as_deref(), Some("Scene Viewing"));
+        assert_eq!(paintable("Harém", "ハーレム").as_deref(), Some("Harem"), "no accent the label doesn't have");
+        assert_eq!(paintable("Move painting left.", "絵を左へ").as_deref(), Some("Move painting left"), "nor a full stop");
+        assert_eq!(paintable("Wait...", "待って…").as_deref(), Some("Wait..."), "but dots stay");
+        assert_eq!(paintable("Café Noël", "Café Noël").as_deref(), Some("Café Noël"), "and those it has stay");
     }
 
     #[test]
@@ -2451,9 +2668,12 @@ mod tests {
 
     #[test]
     fn where_the_picture_doesnt_settle_it_the_word_that_fits_beside_the_others_does() {
-        let asks = |one: &'static str, two: &'static str| likelier(&crate::llm::tests::Scripted::new(&[one, two]), "レスキュー", "いいえ", &["はい".into()]).unwrap();
-        assert_eq!(asks("2", "1").as_deref(), Some("いいえ"));
-        assert_eq!(asks("1", "1"), None, "it only follows the order");
+        let asks = |replies: &[&'static str]| likelier(&crate::llm::tests::Scripted::new(replies), "レスキュー", "いいえ", &["はい".into()]).unwrap();
+        assert_eq!(asks(&["2", "1"]).as_deref(), Some("いいえ"));
+        assert_eq!(asks(&["1", "1"]), None, "it only follows the order");
+        let real = |replies: &[&'static str]| real_of_two(&crate::llm::tests::Scripted::new(replies), "ハッピーテイ", "ハッピーデイ").unwrap();
+        assert_eq!(real(&["NO", "YES"]).as_deref(), Some("ハッピーデイ"), "each asked of on its own");
+        assert_eq!(real(&["YES", "YES"]), None, "and both real is no answer");
     }
 
     #[test]
@@ -2963,6 +3183,91 @@ mod tests {
         translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
         let kept: IndexMap<String, Vec<String>> = load_json(&game.join("vntl_work").join("image_reads.json")).unwrap();
         assert_eq!(kept.values().cloned().collect::<Vec<_>>(), [vec!["彩度".to_string()], vec!["彩度".to_string()]]);
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn english_the_story_model_contradicts_is_redone_and_remembered_for_every_game() {
+        let game = std::env::temp_dir().join(format!("vntl_story_check_{}", std::process::id()));
+        struct Story;
+        impl Chat for Story {
+            fn chat(&self, _: &str, user: &str) -> R<String> {
+                Ok(if user.contains("上機嫌なねこ") { "A cheerful cat" } else { "Back" }.to_string())
+            }
+            fn complete(&self, _: &str, _: f64) -> R<String> {
+                Ok(String::new())
+            }
+            fn read_image(&self, _: &[u8], _: &str) -> R<String> {
+                Ok(String::new())
+            }
+            fn model(&self) -> &str {
+                "story"
+            }
+        }
+        // the words model has the phrase backwards, and sees it once shown the story model's reading
+        let words = crate::llm::tests::Fake(|p: &str| {
+            Ok(if p.contains("contradict each other") {
+                if p.contains("Grumpy") { "CONTRADICT" } else { "AGREE" }
+            } else if p.contains("how a translator read") {
+                "Cheerful Cat"
+            } else {
+                "1: Grumpy Cat\n2: Back"
+            }.to_string())
+        });
+        // and the reading model, a third, takes the new English whichever way round it's shown
+        let judge = crate::llm::tests::Fake(|p: &str| Ok(if p.contains("1: Cheerful") || p.contains("1: A cheerful") { "1" } else { "2" }.to_string()));
+        let pair = crate::llm::Pair { reads: judge, words };
+        let vision = crate::llm::Checked { vision: &pair, story: &Story };
+        let cancel = AtomicBool::new(false);
+        let mut job = Job::new(&game, &vision, &|_| {}, &cancel).unwrap();
+        let todo: Vec<(String, usize, String)> = ["上機嫌なねこ", "戻る"].iter().map(|k| (k.to_string(), 20, String::new())).collect();
+        job.translate_labels("s", &todo, &["p", "p"]).unwrap();
+        job.check_with_story(&todo).unwrap();
+        assert_eq!((job.labels["上機嫌なねこ"].as_str(), job.labels["戻る"].as_str()), ("Cheerful Cat", "Back"), "only what contradicts is redone");
+        let again = Job::new(&game, &vision, &|_| {}, &cancel).unwrap();
+        assert_eq!(again.memory.get("上機嫌なねこ").map(String::as_str), Some("Cheerful Cat"), "the correction is kept");
+        assert!(again.remembered(&[("上機嫌ないぬ".to_string(), 20, String::new())]).contains("上機嫌なねこ = Cheerful Cat"), "and shown for a label like it");
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn look_alike_letters_are_tried_and_a_slash_only_after_japanese() {
+        assert_eq!(look_alikes("バイ"), ["パイ"]);
+        assert!(look_alikes("森のケモ/").contains(&"森のケモノ".to_string()));
+        assert!(look_alikes("BGM/SE").is_empty());
+        assert!(look_alikes("セーブ").contains(&"セープ".to_string()));
+    }
+
+    #[test]
+    fn a_look_alike_letter_goes_by_which_makes_real_japanese_and_short_english_is_kept_apart() {
+        let game = std::env::temp_dir().join(format!("vntl_look_alike_{}", std::process::id()));
+        let gui = game.join("game").join("gui");
+        std::fs::create_dir_all(&gui).unwrap();
+        // a button too narrow for the full English
+        let (w, h) = (110, 40);
+        let mut px = vec![0x0010_1010u32; w * h];
+        (14..26).flat_map(|y| (20..80).map(move |x| y * w + x)).for_each(|i| px[i] = 0x00ff_ffff);
+        std::fs::write(gui.join("title.png"), write_png(&Image { w, h, px }).unwrap()).unwrap();
+        let model = crate::llm::tests::Fake(|p: &str| {
+            if p == *READ_PROMPT {
+                return Ok("バイをやいた".to_string());
+            }
+            // the words know a pie burns, whichever is shown first
+            if p.contains("as a game menu would write it") {
+                return Ok(if p.contains("1: パイ") { "1" } else { "2" }.to_string());
+            }
+            if p.contains("too long for their buttons") {
+                return Ok("1: Burnt".to_string());
+            }
+            Ok("1: The Pie Burned and Turned Black".to_string())
+        });
+        translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
+        let work = game.join("vntl_work");
+        let kept: IndexMap<String, Vec<String>> = load_json(&work.join("image_reads.json")).unwrap();
+        assert_eq!(kept.values().cloned().collect::<Vec<_>>(), [vec!["パイをやいた".to_string()]]);
+        let labels = load_labels(&work.join("image_labels.txt")).unwrap();
+        assert_eq!(labels["パイをやいた"], "The Pie Burned and Turned Black", "the full English stays");
+        assert_eq!(labels[&format!("パイをやいた{SHORT}")], "Burnt", "beside the short form for where it doesn't fit");
         std::fs::remove_dir_all(&game).unwrap();
     }
 

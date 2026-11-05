@@ -1,6 +1,6 @@
 //! The translate command: official lines first, then the model for what is left, then install.
 
-use crate::llm::{is_vntl, notes_fill_prompt, runaway, translate_batch, translate_vntl, trim_memory, Chat, SYSTEM};
+use crate::llm::{is_vntl, notes_fill_prompt, runaway, translate_batch, translate_vntl, trim_memory, Chat, Checked, SYSTEM};
 use crate::menus::{paint_plates, read_plate};
 use crate::ocr::Reader;
 use crate::reference::{apply_reference, copy_reference_files, reference_style, sprites};
@@ -834,7 +834,7 @@ fn translate_unity(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel:
                 log(NO_READER.into());
                 return Ok(());
             }
-            log(crate::menus::translate_unity_art(&o.game, vision.as_ref(), report, cancel)?);
+            log(crate::menus::translate_unity_art(&o.game, &Checked { vision: vision.as_ref(), story: chat }, report, cancel)?);
             log(write_yarn(&o.game, &load_json(&cache_file(&o.game, &o.lang))?)?);
         }
         return Ok(());
@@ -1060,7 +1060,7 @@ fn translate_liar(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: 
     let most = |en: &str, share: usize| en.chars().count() * liar::ROWS * share / (liar::rows(en) * 10);
     shorten_and_write(o, chat, &lines, &Fit { fits: &liar::fits, most: &most, markup: &liar::MARKUP }, &|cache| write_liar(&o.game, cache), &log, cancel)?;
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
-        log(crate::menus::translate_menus(&o.game, vision.as_ref(), report, cancel)?);
+        log(crate::menus::translate_menus(&o.game, &Checked { vision: vision.as_ref(), story: chat }, report, cancel)?);
         // menus are rebuilt from the game's own archive, which has the Japanese plates
         write_plates(&o.game, &load_json(&cache_file(&o.game, &o.lang))?)?;
     }
@@ -1201,7 +1201,7 @@ fn translate_artemis(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cance
         let cache: Cache = load_json(&cache_file(&o.game, &o.lang))?;
         let listed = listed_names(&o.game);
         let english = |jp: &str| english_name(&listed, &cache, jp).filter(|n| !n.is_empty() && !JA.is_match(n));
-        report(Event::Log(crate::menus::translate_artemis_menus(&o.game, vision.as_ref(), &english, report, cancel)?));
+        report(Event::Log(crate::menus::translate_artemis_menus(&o.game, &Checked { vision: vision.as_ref(), story: chat }, &english, report, cancel)?));
         report(Event::Log(write_artemis(&o.game, &cache)?));
     }
     Ok(())
@@ -1221,7 +1221,7 @@ fn translate_bgi(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &
         let cache: Cache = load_json(&cache_file(&o.game, &o.lang))?;
         let listed = listed_names(&o.game);
         let english = |jp: &str| english_name(&listed, &cache, jp);
-        report(Event::Log(crate::menus::translate_bgi_menus(&o.game, vision.as_ref(), &english, report, cancel)?));
+        report(Event::Log(crate::menus::translate_bgi_menus(&o.game, &Checked { vision: vision.as_ref(), story: chat }, &english, report, cancel)?));
         report(Event::Log(write_bgi(&o.game, &cache)?));
     }
     Ok(())
@@ -1466,7 +1466,7 @@ fn translate_rpgmaker(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), canc
     }
     health(&cache, &log);
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images && !crate::rgss::present(&o.game) && !crate::lcf::present(&o.game)) {
-        log(crate::menus::translate_rpgmaker_menus(&o.game, vision.as_ref(), report, cancel)?);
+        log(crate::menus::translate_rpgmaker_menus(&o.game, &Checked { vision: vision.as_ref(), story: chat }, report, cancel)?);
     }
     Ok(())
 }
@@ -1589,11 +1589,11 @@ pub fn translate(o: &Options, chat: &dyn Chat, report: &dyn Fn(Event), cancel: &
         o.lang
     ));
     if let Some(vision) = o.vision.as_ref().filter(|_| o.images) {
-        log(crate::menus::translate_renpy_menus(&o.game, &o.lang, vision.as_ref(), report, cancel)?);
+        log(crate::menus::translate_renpy_menus(&o.game, &o.lang, &Checked { vision: vision.as_ref(), story: chat }, report, cancel)?);
     }
     if let Some(vision) = o.vision.as_ref().filter(|_| o.art) {
         match crate::ocr::installed() {
-            true => log(crate::menus::translate_art(&o.game, &o.lang, vision.as_ref(), report, cancel)?),
+            true => log(crate::menus::translate_art(&o.game, &o.lang, &Checked { vision: vision.as_ref(), story: chat }, report, cancel)?),
             false => log(NO_READER.into()),
         }
     }
