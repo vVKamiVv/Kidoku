@@ -683,6 +683,39 @@ fn get_model(ui: &AppWindow, model: String) {
     });
 }
 
+/// Forget what was read in the game's menu images and their English, after asking, so the next
+/// Translate reads and translates them again.
+fn forget_menus(ui: &AppWindow) {
+    let Some(game) = game_folder(ui) else {
+        ui.set_status_text("Pick a game folder first.".into());
+        return;
+    };
+    let files = vntl::menus::menu_files(&game);
+    if files.is_empty() {
+        ui.set_status_text("The menu images haven't been read yet.".into());
+        return;
+    }
+    let answer = rfd::MessageDialog::new()
+        .set_title("Read menus again")
+        .set_description(
+            "Forget what was read in this game's menu images, and their English?\n\nThe next Translate reads and translates them \
+             again. Corrections you made in image_labels.txt go too.",
+        )
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show();
+    if answer != rfd::MessageDialogResult::Yes {
+        return;
+    }
+    for file in &files {
+        if let Err(e) = fs::remove_file(file) {
+            append_log(ui, &format!("{}: {e}", file.display()));
+            return;
+        }
+    }
+    append_log(ui, "Forgot the menu images' readings and English: the next Translate reads them again.");
+    ui.set_status_text("Menus will be read again.".into());
+}
+
 fn remove_backups(ui: &AppWindow, game: &Path) {
     let files = vntl::backups(game);
     if files.is_empty() {
@@ -1019,6 +1052,8 @@ fn main() -> Result<(), slint::PlatformError> {
     });
     let w = ui.as_weak();
     ui.on_remove(move || remove(&w.unwrap()));
+    let w = ui.as_weak();
+    ui.on_forget_menus(move || forget_menus(&w.unwrap()));
     let w = ui.as_weak();
     ui.on_fit_box(move || fit_box(&w.unwrap()));
     let (w, sampler) = (ui.as_weak(), Arc::new(Mutex::new(Sampler::default())));

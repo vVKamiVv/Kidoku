@@ -37,6 +37,15 @@ const LABELS_HELP: &str = "# Text read from the game's menu images and its Engli
 ";
 /// What marks a label's short English in image_labels.txt.
 const SHORT: &str = " [short]";
+/// What was read in each block of a game's menu pictures, and the labels' English, in vntl_work.
+const READS_FILE: &str = "image_reads.json";
+const LABELS_FILE: &str = "image_labels.txt";
+
+/// Those of a game's files that are there: without them, the next run reads and translates its menu
+/// pictures again.
+pub fn menu_files(game: &Path) -> Vec<PathBuf> {
+    [READS_FILE, LABELS_FILE].iter().map(|f| game.join("vntl_work").join(f)).filter(|p| p.is_file()).collect()
+}
 const MEMORY_HELP: &str = "# Menu labels whose English the story's model corrected, in any game: readings = English
 # Used again wherever a label reads the same, and shown to the model as examples. Lines starting with # are ignored.
 ";
@@ -1033,7 +1042,7 @@ impl<'a> Job<'a> {
     fn new(game: &Path, vision: &'a dyn Chat, report: &'a dyn Fn(Event), cancel: &'a AtomicBool) -> R<Self> {
         let work = game.join("vntl_work");
         std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
-        let (reads_path, labels_path) = (work.join("image_reads.json"), work.join("image_labels.txt"));
+        let (reads_path, labels_path) = (work.join(READS_FILE), work.join(LABELS_FILE));
         let cached = if reads_path.exists() { load_json(&reads_path)? } else { IndexMap::new() };
         let labels = if labels_path.exists() { load_labels(&labels_path)? } else { IndexMap::new() };
         let font = bold_font()?;
@@ -3310,6 +3319,19 @@ mod tests {
         translate_renpy_menus(&game, "english", &model, &|_| {}, &AtomicBool::new(false)).unwrap();
         let kept: IndexMap<String, Vec<String>> = load_json(&game.join("vntl_work").join("image_reads.json")).unwrap();
         assert_eq!(kept.values().cloned().collect::<Vec<_>>(), [vec!["星降る夜に".to_string()], vec!["星降る夜に".to_string()]]);
+        std::fs::remove_dir_all(&game).unwrap();
+    }
+
+    #[test]
+    fn a_games_menu_files_are_the_reads_and_labels_it_has() {
+        let game = std::env::temp_dir().join(format!("vntl_menu_files_{}", std::process::id()));
+        std::fs::create_dir_all(game.join("vntl_work")).unwrap();
+        assert!(menu_files(&game).is_empty(), "none before the menus are read");
+        let (cancel, chat) = (AtomicBool::new(false), Scripted::new(&[]));
+        let job = Job::new(&game, &chat, &|_| {}, &cancel).unwrap();
+        std::fs::write(&job.reads_path, "{}").unwrap();
+        save_labels(&job.labels_path, &IndexMap::new()).unwrap();
+        assert_eq!(menu_files(&game), [job.reads_path.clone(), job.labels_path.clone()]);
         std::fs::remove_dir_all(&game).unwrap();
     }
 

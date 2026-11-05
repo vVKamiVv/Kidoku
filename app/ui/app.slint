@@ -957,6 +957,7 @@ export component AppWindow inherits Window {
     callback memory-moved(int);
     callback lines-switched(bool);
     callback remove();
+    callback forget-menus();
     callback fit-box();
     callback read-usage();
     callback link-flipped(int);
@@ -1088,6 +1089,10 @@ export component AppWindow inherits Window {
                                         if root.offers.fit: HorizontalLayout {
                                             alignment: start;
                                             Button { text: "Fit text to the box…"; accessible-label: "Measure the message box from a screenshot"; enabled: !root.running; clicked => { root.fit-box(); } }
+                                        }
+                                        if root.offers.images: HorizontalLayout {
+                                            alignment: start;
+                                            Button { kind: 3; text: "Read menus again…"; accessible-label: "Forget what was read in the menu images and their English"; enabled: !root.running; clicked => { root.forget-menus(); } }
                                         }
                                     }
                                 }
