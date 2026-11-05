@@ -683,6 +683,50 @@ fn get_model(ui: &AppWindow, model: String) {
     });
 }
 
+/// The log's own lines, each post whole again with its time, and the game's lines left out.
+fn log_lines(rows: impl Iterator<Item = LogRow>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for r in rows.filter(|r| r.kind == 0) {
+        match lines.last_mut() {
+            // a post folded onto more rows has its time on the first
+            Some(last) if r.time.is_empty() => {
+                last.push(' ');
+                last.push_str(&r.text);
+            }
+            _ => lines.push(format!("{}  {}", r.time, r.text)),
+        }
+    }
+    lines
+}
+
+/// The log as a text file for a bug report, the PC, models and engine on top. The game's own lines
+/// stay out, and paths lose the user's name, since the file is meant to be posted.
+fn save_log(ui: &AppWindow) {
+    let dialog = rfd::FileDialog::new().set_title("Save the log for a bug report").set_file_name("kidoku-log.txt").add_filter("Text", &["txt"]);
+    let Some(path) = dialog.save_file() else { return };
+    let lines = log_lines(ui.get_rows().iter());
+    let named = |m: SharedString| if m.is_empty() { "none".to_string() } else { m.to_string() };
+    let picked = format!(
+        "Model: {}\nImage model: {}\nMenu reading model: {}\nEngine: {}",
+        named(ui.get_model()), named(ui.get_vision_model()), named(ui.get_reading_model()), ui.get_engine_text()
+    );
+    let url = ui.get_url().to_string();
+    let weak = ui.as_weak();
+    ui.set_status_text("Saving the log…".into());
+    std::thread::spawn(move || {
+        let text = format!("Kidoku {}\n{}\n{picked}\n\n{}\n", version_text(), vntl::usage::about_pc(&url), lines.join("\n"));
+        let text = match std::env::var("USERPROFILE") {
+            Ok(home) if !home.is_empty() => text.replace(&home, "%USERPROFILE%"),
+            _ => text,
+        };
+        let said = match std::fs::write(&path, text) {
+            Ok(()) => format!("Saved the log as {}. Attach it to an issue on GitHub.", path.display()),
+            Err(e) => format!("Couldn't save the log: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status_text(said.into()));
+    });
+}
+
 /// Forget what was read in the game's menu images and their English, after asking, so the next
 /// Translate reads and translates them again.
 fn forget_menus(ui: &AppWindow) {
@@ -1055,6 +1099,8 @@ fn main() -> Result<(), slint::PlatformError> {
     let w = ui.as_weak();
     ui.on_forget_menus(move || forget_menus(&w.unwrap()));
     let w = ui.as_weak();
+    ui.on_save_log(move || save_log(&w.unwrap()));
+    let w = ui.as_weak();
     ui.on_fit_box(move || fit_box(&w.unwrap()));
     let (w, sampler) = (ui.as_weak(), Arc::new(Mutex::new(Sampler::default())));
     ui.on_read_usage(move || read_usage(&w.unwrap(), sampler.clone()));
@@ -1183,8 +1229,10 @@ mod tests {
     fn hiding_the_translated_lines_keeps_the_log_and_numbers_it_again() {
         let row = |time: &str, number, text: &str, kind| LogRow { time: time.into(), number, text: text.into(), kind };
         let rows = [row("21:00", 5, "start", 0), row("21:01", 6, "やあ", 1), row("", 6, "Hi", 2), row("21:02", 7, "a long", 0), row("", 7, "error", 0)];
-        let kept = without_lines(rows.into_iter());
+        let kept = without_lines(rows.clone().into_iter());
         assert_eq!(kept.iter().map(|r| (r.number, r.text.as_str())).collect::<Vec<_>>(), [(5, "start"), (6, "a long"), (6, "error")]);
+        // a saved log has each post on one line, without the game's lines
+        assert_eq!(log_lines(rows.into_iter()), ["21:00  start", "21:02  a long error"]);
     }
 
     #[test]

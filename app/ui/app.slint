@@ -958,6 +958,7 @@ export component AppWindow inherits Window {
     callback lines-switched(bool);
     callback remove();
     callback forget-menus();
+    callback save-log();
     callback fit-box();
     callback read-usage();
     callback link-flipped(int);
@@ -1309,6 +1310,13 @@ export component AppWindow inherits Window {
                                         Field { text: "Made by"; Text { text: "TruEKami"; font-weight: 700; color: Theme.pink; vertical-alignment: center; horizontal-stretch: 1; } }
                                         Field { text: "License"; Text { text: "GPL-3.0"; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; } }
                                         Field { text: "Thanks to"; Text { text: "lmg-anon's VNTL models, meikiocr, Ollama, Slint and VNDB"; color: Theme.text; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; } }
+                                        Field {
+                                            text: "Problem?";
+                                            HorizontalLayout {
+                                                alignment: start;
+                                                Button { kind: 3; text: "Save log…"; accessible-label: "Save the log, with your PC and models, to attach to a bug report"; clicked => { root.save-log(); } }
+                                            }
+                                        }
                                         Row {
                                             alignment: start;
                                             Button { text: "GitHub"; clicked => { root.open-page("https://github.com/vVKamiVv/Kidoku"); } }

@@ -18,37 +18,32 @@ body:
     validations:
       required: true
   - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Press **Save log…** on the About page and drag the file here. It has your Kidoku version, PC and models too, so you can skip the fields below. On a version without that button, a screenshot of the log.
+  - type: textarea
     id: models
     attributes:
       label: Models
-      description: As picked on the Model tab. Write "none" for one you didn't pick.
+      description: As picked on the Model tab, if you didn't attach a log. Write "none" for one you didn't pick.
       value: |
         Model:
         Image model:
         Menu reading model:
-    validations:
-      required: true
   - type: input
     id: version
     attributes:
       label: Kidoku version
-      description: On the About tab.
+      description: On the About page, if you didn't attach a log.
       placeholder: "0.1.9"
-    validations:
-      required: true
   - type: textarea
     id: pc
     attributes:
       label: Your PC
+      description: If you didn't attach a log.
       value: |
         Windows version:
         CPU:
         GPU and its memory:
         RAM:
-    validations:
-      required: true
-  - type: textarea
-    id: log
-    attributes:
-      label: Log
-      description: A screenshot of the window's last log lines, or the error they show typed out.

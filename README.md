@@ -210,7 +210,7 @@ vntl write <game>
 
 This repo holds no game files. Please use the app on games you own.
 
-Something went wrong? [Open an issue](https://github.com/vVKamiVv/Kidoku/issues/new/choose): the form asks for your PC, models and games.
+Something went wrong? Press **Save log…** on the About page, then [open an issue](https://github.com/vVKamiVv/Kidoku/issues/new/choose) and attach the file. It lists your PC and models too.
 
 ## `>>8` License
 

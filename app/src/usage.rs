@@ -96,6 +96,35 @@ fn loaded_models(url: &str) -> Option<Vec<Model>> {
     parse_models(&reply.body_mut().read_json().ok()?)
 }
 
+/// The PC and the model server, as a bug report asks for them: Windows, CPU, RAM, each graphics card
+/// with its memory, and the server's version. What can't be read says so.
+pub fn about_pc(url: &str) -> String {
+    // a card's memory as its driver counts it: Windows' video controller entry stops at 4 GB
+    const SCRIPT: &str = r#"$o = Get-CimInstance Win32_OperatingSystem
+"Windows: $($o.Caption) $($o.Version)"
+"CPU: $(((Get-CimInstance Win32_Processor).Name | ForEach-Object { $_.Trim() }) -join ', ')"
+"RAM: $([math]::Round($o.TotalVisibleMemorySize / 1MB)) GB"
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0*' -ErrorAction SilentlyContinue | Where-Object DriverDesc | ForEach-Object { $m = $_.'HardwareInformation.qwMemorySize'; "GPU: $($_.DriverDesc)" + $(if ($m -ge 1GB) { ", $([math]::Round($m / 1GB)) GB" } elseif ($m) { ", $([math]::Round($m / 1MB)) MB" }) }"#;
+    let root = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or("C:\\Windows".into()));
+    let mut command = std::process::Command::new(root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+    command.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // no console window flashing up
+    }
+    let pc = command.output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().replace("\r\n", "\n")).filter(|s| !s.is_empty());
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(2))).build().into();
+    let server = agent.get(format!("{}/api/version", url.trim_end_matches('/'))).call().ok()
+        .and_then(|mut r| r.body_mut().read_json::<Value>().ok())
+        .and_then(|v| v["version"].as_str().map(|v| format!("Ollama {v}")));
+    format!(
+        "{}\nModel server: {}",
+        pc.unwrap_or_else(|| "Windows, CPU, RAM and GPU: couldn't be read".into()),
+        server.unwrap_or_else(|| format!("no version from {url}")),
+    )
+}
+
 /// `memory.used, memory.total, utilization.gpu` of the first card.
 fn parse_card(line: &str) -> Option<Card> {
     let mut values = line.split(',').map(|v| v.trim().parse::<u64>().ok());
