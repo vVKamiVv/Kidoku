@@ -64,17 +64,17 @@
 | **Unity** | String tables, or Yarn Spinner lines, on-screen text, the game's own lists and text in its code | Yarn Spinner games: text over artwork if you turn it on | Games that use Unity's Localization package or Yarn Spinner only |
 | **Liar-soft** | Script and menus | Yes | Speakers come from the name plates, read by the text reader or an image model, and the plates are repainted in English. The engine patch needs a build with the same byte pattern |
 | **RPG Maker MV/MZ** | Messages, choices, database, menu terms and plugin text | Short images, encrypted ones too | Other plugin settings stay Japanese until they're listed |
-| **Malie** | Messages and names | Not yet | The key is found in the game's program |
+| **Malie** | Messages and names | Not yet | The key is found in the game's program. Older LIBU archives work too |
 | **SiglusEngine** | Messages, names, choices, the right-click menu and dialogs | System pictures (`g00`) | The key is worked out from the game's own scenes |
 | **QLIE** | Story text, names and choices | Not yet | FilePackVer3.1 packs only |
 | **Wolf RPG Editor** | Messages, choices, picture text and databases | Not yet | Old archives only |
-| **RealLive** | Messages, names, choices, the right-click menu and dialogs | Its window buttons are already English | Compiler 10002 scripts only |
+| **RealLive** | Messages, names, choices, the right-click menu and dialogs | Its window buttons are already English | Compilers 10002, 110002 and 1110002 |
 | **CatSystem2** | Messages, names and choices | Not yet | The passphrase is read from the game's program |
 | **Majiro** | Messages, names and choices | Not yet | ArcV3 archives only |
 | **YU-RIS** | Messages, names and choices | Not yet | The engine wraps lines itself, and may cut words |
-| **BGI/Ethornell** | Messages, names, menus and dialogs | Labels and buttons on menu screens | BURIKO ARC20 only |
+| **BGI/Ethornell** | Messages, names, menus and dialogs | Labels and buttons on menu screens | ARC20 and older PackFile archives, encrypted files too |
 | **AdvHD** | Messages, names, choices, phone messages and the settings screen's sample lines | Not yet | Shift-JIS scripts only |
-| **KiriKiri** | Messages, shown tag values, and menus and dialogs in `.tjs` files | Not yet | `.ks` scripts in plain archives only |
+| **KiriKiri** | Messages, shown tag values, and menus and dialogs in `.tjs` files | Not yet | `.ks` scripts. Encrypted archives work when the [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do#kirikiri-encryption) lists their encryption |
 | **Artemis** | Messages, names, choices and pop-ups | Labels on plain backgrounds, and drawn names | Version 6 and 8 archives with `.iet` scripts only |
 | **Softpal** | Messages, names and choices | Not yet | `Sv20` scripts only |
 | **FVP** | Messages, names and other text the script passes around | Not yet | Strings it only compares stay Japanese |
@@ -83,7 +83,7 @@
 | **TyranoScript** | Scenes, names, buttons and the engine's own prompts, in a folder, `app.asar` or the exe | Not yet | Other text in the game's `.js` and HTML stays Japanese |
 | **NScripter** | Messages, choices and menus | Not yet | Old saves won't line up with the new script |
 
-From Malie down, engines are checked on real games' files, and most haven't been played through yet. The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do) has more on each.
+The [guidebook](https://github.com/vVKamiVv/Kidoku/wiki/What-each-engine-can-do) has more on each.
 
 ## `>>3` Getting started
 
