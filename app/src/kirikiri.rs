@@ -6,12 +6,14 @@
 use crate::pipeline::Line;
 use crate::text::{ascii_punctuation, sjis, text_units, wrap_words, JA};
 use crate::yuris::adler32;
+use crate::xp3::Crypt;
 use crate::{backup, extend_file, R};
 use crate::code::{shown_strings, with_english, TJS};
 use encoding_rs::SHIFT_JIS;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use regex::Regex;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -53,6 +55,17 @@ struct Entry {
     chunk: Range<usize>,
     /// `(packed, offset, stored size)`
     segments: Vec<(bool, u64, u64)>,
+    /// The `adlr` checksum, which also keys a filter.
+    hash: Option<u32>,
+    /// Read through the archive's filter, so written back through it too.
+    sealed: Cell<bool>,
+}
+
+/// Name chunks: a checksum, a length, then UTF-16.
+const NAMES: [&[u8]; 2] = [b"hnfn", b"eliF"];
+
+fn utf16(v: &[u8], count: usize) -> String {
+    String::from_utf16_lossy(&v.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).take(count).collect::<Vec<_>>())
 }
 
 /// Inner chunks: four letters, a u64 size, then that many bytes.
@@ -70,23 +83,29 @@ fn chunks(b: &[u8]) -> Vec<(&[u8], Range<usize>)> {
 }
 
 fn entries(index: &[u8]) -> Vec<Entry> {
+    let names: HashMap<u32, String> = chunks(index).into_iter().filter(|(tag, r)| NAMES.contains(tag) && r.len() >= 6).map(|(_, r)| {
+        let v = &index[r];
+        (u32_at(v, 0), utf16(&v[6..], u16::from_le_bytes([v[4], v[5]]) as usize))
+    }).collect();
     let mut out = Vec::new();
     for (tag, body) in chunks(index) {
         if tag != b"File" {
             continue;
         }
         let (start, inner) = (body.start, &index[body.clone()]);
-        let (mut name, mut segments) = (String::new(), Vec::new());
+        let (mut name, mut segments, mut hash) = (String::new(), Vec::new(), None);
         for (tag, r) in chunks(inner) {
             let v = &inner[r];
             if tag == b"info" && v.len() >= 22 {
-                let units: Vec<u16> = v[22..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).take(u16::from_le_bytes([v[20], v[21]]) as usize).collect();
-                name = String::from_utf16_lossy(&units);
+                name = utf16(&v[22..], u16::from_le_bytes([v[20], v[21]]) as usize);
             } else if tag == b"segm" {
                 segments = v.as_chunks::<28>().0.iter().map(|s| (u32_at(s, 0) & PACKED == 1, u64_at(s, 4), u64_at(s, 20))).collect();
+            } else if tag == b"adlr" && v.len() >= 4 {
+                hash = Some(u32_at(v, 0));
             }
         }
-        out.push(Entry { name, chunk: start - 12..body.end, segments });
+        let name = hash.and_then(|h| names.get(&h).cloned()).unwrap_or(name);
+        out.push(Entry { name, chunk: start - 12..body.end, segments, hash, sealed: Cell::new(false) });
     }
     out
 }
@@ -129,13 +148,35 @@ struct Archive {
     pointer: usize,
     index: Vec<u8>,
     entries: Vec<Entry>,
+    crypt: Option<Crypt>,
+}
+
+fn read_at(f: &mut fs::File, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(at))?;
+    f.read_exact(buf)
 }
 
 impl Archive {
     /// None when the file isn't an XP3 archive. Index and offsets come from the game's own file.
     fn open(path: &Path) -> R<Option<Archive>> {
         let kept = backup(path);
-        Archive::read(if kept.exists() { &kept } else { path }, path)
+        let from = if kept.exists() { &kept } else { path };
+        let Some(mut archive) = Archive::read(from, path)? else { return Ok(None) };
+        archive.crypt = archive.learn(from);
+        Ok(Some(archive))
+    }
+
+    /// The filter its files are under, found from a few whose stored bytes don't match their checksum.
+    fn learn(&self, from: &Path) -> Option<Crypt> {
+        let mut f = fs::File::open(from).ok()?;
+        let size = |e: &Entry| e.segments.iter().map(|s| s.2).sum::<u64>();
+        let mut by_size: Vec<&Entry> = self.entries.iter().filter(|e| e.hash.is_some() && size(e) >= 1024).collect();
+        by_size.sort_by_key(|e| size(e));
+        let samples: Vec<(u32, Vec<u8>)> = by_size.iter().take(8).filter_map(|e| {
+            let (h, raw) = (e.hash?, self.file(&mut f, e).ok()?);
+            (adler32(&raw) != h).then_some((h, raw))
+        }).take(4).collect();
+        Crypt::detect(&samples, self.path.parent()?)
     }
 
     fn read(from: &Path, path: &Path) -> R<Option<Archive>> {
@@ -149,32 +190,41 @@ impl Archive {
         let mut pointer = MAGIC.len();
         let mut at = u64_at(&head, pointer);
         let mut top = [0; 17];
-        let mut read = |at: u64, top: &mut [u8; 17]| f.seek(SeekFrom::Start(at)).and_then(|_| f.read_exact(top));
-        read(at, &mut top).map_err(err)?;
-        if top[0] == CUSHION {
+        read_at(&mut f, at, &mut top).map_err(err)?;
+        if top[0] == CUSHION && u32_at(&head, MAGIC.len() + 8) == 1 {
             pointer = at as usize + 9;
             if pointer + 8 > HEAD {
                 return Err(format!("{}: this archive's header isn't one we know", path.display()));
             }
             at = u64_at(&head, pointer);
-            read(at, &mut top).map_err(err)?;
+            read_at(&mut f, at, &mut top).map_err(err)?;
         }
-        let packed = top[0] & PACKED as u8 == 1;
-        let stored = u64_at(&top, 1);
-        let start = at + if packed { 17 } else { 9 };
-        if start + stored > len {
-            return Err(format!("{}: the index runs past the end of the file", path.display()));
-        }
-        f.seek(SeekFrom::Start(start)).map_err(err)?;
-        let mut index = vec![0; stored as usize];
-        f.read_exact(&mut index).map_err(err)?;
-        if packed {
-            let mut plain = Vec::new();
-            ZlibDecoder::new(&index[..]).read_to_end(&mut plain).map_err(err)?;
-            index = plain;
+        // The index can come in parts, each flagged 0x80 and followed by where the next one is.
+        let mut index = Vec::new();
+        for _ in 0..1024 {
+            let packed = top[0] & PACKED as u8 == 1;
+            let stored = u64_at(&top, 1);
+            let start = at + if packed { 17 } else { 9 };
+            if start.saturating_add(stored) > len {
+                return Err(format!("{}: the index runs past the end of the file", path.display()));
+            }
+            let mut part = vec![0; stored as usize];
+            read_at(&mut f, start, &mut part).map_err(err)?;
+            if packed {
+                ZlibDecoder::new(&part[..]).read_to_end(&mut index).map_err(err)?;
+            } else {
+                index.extend(part);
+            }
+            if top[0] & 0x80 == 0 {
+                break;
+            }
+            let mut next = [0; 8];
+            f.read_exact(&mut next).map_err(err)?;
+            at = u64::from_le_bytes(next);
+            read_at(&mut f, at, &mut top).map_err(err)?;
         }
         let entries = entries(&index);
-        Ok(Some(Archive { path: path.to_path_buf(), len, head, pointer, index, entries }))
+        Ok(Some(Archive { path: path.to_path_buf(), len, head, pointer, index, entries, crypt: None }))
     }
 
     fn file(&self, f: &mut fs::File, e: &Entry) -> R<Vec<u8>> {
@@ -188,7 +238,11 @@ impl Archive {
                 out.extend(b);
             }
         }
-        Ok(out)
+        let (Some(crypt), Some(h)) = (&self.crypt, e.hash) else { return Ok(out) };
+        if adler32(&out) == h {
+            return Ok(out);
+        }
+        Ok(crypt.open(&out, h).inspect(|_| e.sealed.set(true)).unwrap_or(out))
     }
 
     /// New contents for some entries go on the end, then a new index.
@@ -197,14 +251,27 @@ impl Archive {
         let mut order: Vec<_> = new.iter().collect();
         order.sort_by_key(|(i, _)| self.entries[*i].chunk.start);
         let (mut index, mut copied) = (Vec::new(), 0);
+        let mut moved = HashMap::new();
         for (i, bytes) in order {
-            let chunk = &self.entries[*i].chunk;
-            index.extend(&self.index[copied..chunk.start]);
-            index.extend(file_chunk(&self.index[chunk.clone()], bytes, self.len + tail.len() as u64));
-            copied = chunk.end;
-            tail.extend(bytes);
+            let e = &self.entries[*i];
+            index.extend(&self.index[copied..e.chunk.start]);
+            index.extend(file_chunk(&self.index[e.chunk.clone()], bytes, self.len + tail.len() as u64));
+            copied = e.chunk.end;
+            let h = adler32(bytes);
+            moved.extend(e.hash.map(|old| (old, h)));
+            match &self.crypt {
+                Some(crypt) if e.sealed.get() => tail.extend(crypt.seal(bytes, h).ok_or_else(|| format!("{}: can't write this file under the game's encryption", e.name))?),
+                _ => tail.extend(bytes),
+            }
         }
         index.extend(&self.index[copied..]);
+        // Name chunks find their file by checksum, which changed with the contents.
+        let names: Vec<usize> = chunks(&index).into_iter().filter(|(tag, r)| NAMES.contains(tag) && r.len() >= 6).map(|(_, r)| r.start).collect();
+        for at in names {
+            if let Some(h) = moved.get(&u32_at(&index, at)) {
+                index[at..at + 4].copy_from_slice(&h.to_le_bytes());
+            }
+        }
         let mut z = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         z.write_all(&index).map_err(|e| e.to_string())?;
         let packed = z.finish().map_err(|e| e.to_string())?;
@@ -754,6 +821,28 @@ fn shown_values(line: &str, n: usize, at: usize, name: &str, tag: &str, units: &
 static TJS_SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"MenuItem\(|askYesNo\(|System\.inform\(|[Cc]aption\s*[:=]|\.hint\s*=|System\.title\s*=").unwrap());
 static TJS_NOT_SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"==|!=|\bcase\b|\bdm\(|Debug|throw|Exception|\.storage|\.(?:ks|tjs|png|jpg|ogg|wav|txt)\b|/").unwrap());
 
+/// Text the engine keeps scrambled (`FE FE`, a mode, then a UTF-16 mark), as plain UTF-16, which
+/// it reads just as well.
+fn unscrambled(b: Vec<u8>) -> Vec<u8> {
+    if b.len() < 5 || b[..2] != [0xFE, 0xFE] || b[3..5] != [0xFF, 0xFE] {
+        return b;
+    }
+    let units = b[5..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c));
+    let plain: Vec<u8> = match b[2] {
+        0 => units.map(|ch| if ch >= 0x20 { ch ^ (((ch & 0xFE) << 8) ^ 1) } else { ch }).flat_map(u16::to_le_bytes).collect(),
+        1 => units.map(|ch| ((ch & 0xAAAA) >> 1) | ((ch & 0x5555) << 1)).flat_map(u16::to_le_bytes).collect(),
+        2 if b.len() > 21 => {
+            let mut out = Vec::new();
+            if ZlibDecoder::new(&b[21..]).read_to_end(&mut out).is_err() {
+                return b;
+            }
+            out
+        }
+        _ => return b,
+    };
+    [&[0xFF, 0xFE], &plain[..]].concat()
+}
+
 /// A `.tjs` file in one string. None if it wouldn't go back to the same bytes as it stands.
 fn tjs_text(b: &[u8]) -> Option<(String, Coding)> {
     let (text, coding) = if b.starts_with(&[0xFF, 0xFE]) {
@@ -822,7 +911,7 @@ impl Game {
             let archive = &archives[a];
             let from = if backup(&archive.path).exists() { backup(&archive.path) } else { archive.path.clone() };
             let mut f = fs::File::open(from).map_err(|e| e.to_string())?;
-            let bytes = archive.file(&mut f, &archive.entries[i])?;
+            let bytes = unscrambled(archive.file(&mut f, &archive.entries[i])?);
             if name.ends_with(".ks") {
                 scripts.push((a, i, Script::read(name, &bytes, &mut widths)));
             } else if let Some((text, coding)) = tjs_text(&bytes) {
@@ -838,7 +927,7 @@ impl Game {
         scripts.iter().for_each(|s: &(usize, usize, Script)| speakers.learn(&s.2));
         scripts.iter_mut().for_each(|s| s.2.name_speakers(&speakers));
         if scripts.iter().all(|s| s.2.units.is_empty()) {
-            return Err("No text found in this KiriKiri game's .ks scripts: they may be encrypted, or compiled to .scn.".into());
+            return Err("No text found in this KiriKiri game's .ks scripts: they may be encrypted in a way Kidoku doesn't know, or compiled to .scn.".into());
         }
         Ok(Game { archives, scripts, code: files, width: crate::fit::letters(game, box_width(widths, LINE_LETTERS)) })
     }
@@ -875,7 +964,8 @@ pub fn install(game: &Path, line: &dyn Fn(&str) -> Option<String>) -> R<usize> {
             continue;
         }
         archive.replace(&new)?;
-        let back = Archive::read(&archive.path, &archive.path)?.ok_or("the archive didn't read back")?;
+        let mut back = Archive::read(&archive.path, &archive.path)?.ok_or("the archive didn't read back")?;
+        back.crypt = archive.crypt.clone();
         let mut f = fs::File::open(&archive.path).map_err(|e| e.to_string())?;
         for (i, bytes) in &new {
             if back.file(&mut f, &back.entries[*i])? != *bytes {
@@ -1061,6 +1151,57 @@ mod tests {
         // a second run starts from the game's own file and gives the same bytes
         install(&dir, &line).unwrap();
         assert_eq!(fs::read(&path).unwrap(), written);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_encrypted_archive_with_named_files_and_an_index_in_parts_is_read_and_written_back_encrypted() {
+        let utf16 = |t: &str| -> Vec<u8> { t.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        // Scrambled text, mode 1: each pair of bits swapped.
+        let swapped: Vec<u8> = utf16(&"一行目です[p]\r\n".repeat(60)).as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).map(|ch| ((ch & 0xAAAA) >> 1) | ((ch & 0x5555) << 1)).flat_map(u16::to_le_bytes).collect();
+        let plain = [&[0xFE, 0xFE, 1, 0xFF, 0xFE][..], &swapped].concat();
+        let h = adler32(&plain);
+        assert_ne!(h as u8, 0);
+        let stored: Vec<u8> = plain.iter().map(|b| b ^ h as u8).collect();
+
+        let mut out = MAGIC.to_vec();
+        out.extend([0; 12]);
+        let name = [&h.to_le_bytes()[..], &13u16.to_le_bytes(), &utf16("scenario/a.ks")].concat();
+        let mut first = [b"hnfn".as_slice(), &(name.len() as u64).to_le_bytes(), &name].concat();
+        first.extend(entry("5c3f0a1d", out.len() as u64, &plain, stored.len() as u64, 0));
+        out.extend(&stored);
+        let second = entry("image.png", out.len() as u64, b"picture", 7, 0);
+        out.extend(b"picture");
+        let at = out.len() as u64;
+        out[11..19].copy_from_slice(&at.to_le_bytes());
+        out.push(0x80);
+        out.extend((first.len() as u64).to_le_bytes());
+        out.extend(&first);
+        out.extend((out.len() as u64 + 8).to_le_bytes());
+        let packed = pack(&second);
+        out.push(1);
+        out.extend((packed.len() as u64).to_le_bytes());
+        out.extend((second.len() as u64).to_le_bytes());
+        out.extend(packed);
+
+        let dir = std::env::temp_dir().join(format!("vntl-kirikiri-sealed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.xp3");
+        fs::write(&path, out).unwrap();
+        assert_eq!(Game::open(&dir).unwrap().lines().len(), 60);
+        assert_eq!(install(&dir, &|_| Some("Line.".into())).unwrap(), 60);
+
+        let mut f = fs::File::open(&path).unwrap();
+        let mut a = Archive::read(&path, &path).unwrap().unwrap();
+        assert_eq!(a.entries[0].name, "scenario/a.ks", "the name chunk follows the new checksum");
+        assert!(!a.file(&mut f, &a.entries[0]).unwrap().starts_with(&[0xFF, 0xFE]), "stored under the game's encryption");
+        a.crypt = a.learn(&path);
+        let text = a.file(&mut f, &a.entries[0]).unwrap();
+        let text = String::from_utf16_lossy(&text[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect::<Vec<_>>());
+        assert!(text.contains("Line.") && !text.contains("一行目"), "{text}");
+        assert_eq!(a.file(&mut f, &a.entries[1]).unwrap(), b"picture");
+        drop(f);
         let _ = fs::remove_dir_all(dir);
     }
 

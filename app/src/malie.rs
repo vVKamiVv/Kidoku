@@ -269,21 +269,38 @@ pub struct Lib {
     cipher: Cipher,
     index: Vec<u8>,
     offsets: Vec<u8>,
+    /// Where the data starts; in a LIBU archive, where the index ends.
     base: u64,
+    /// The older LIBU: a flat list of 80-byte entries, each with its own place in the file.
+    libu: bool,
     pub items: Vec<Item>,
 }
+
+/// A LIBU entry: a UTF-16 name, then the size and the place in the file.
+const LIBU_ROW: usize = 80;
 
 impl Lib {
     pub fn open(f: &mut fs::File, cipher: Cipher) -> R<Lib> {
         let head = read_at(f, &cipher, 0, 16)?;
+        if &head[..4] == b"LIBU" {
+            let count = u32_at(&head, 8)? as usize;
+            let index = read_at(f, &cipher, 16, LIBU_ROW * count)?;
+            let mut items = Vec::with_capacity(count);
+            for (entry, e) in index.as_chunks::<LIBU_ROW>().0.iter().enumerate() {
+                let units: Vec<u16> = e[..68].as_chunks::<2>().0.iter().map(|&u| u16::from_le_bytes(u)).take_while(|&u| u != 0).collect();
+                items.push(Item { path: String::from_utf16_lossy(&units), entry, slot: 0, size: u32_at(e, 68)? });
+            }
+            let base = (16 + (LIBU_ROW * count) as u64 + 15) & !15;
+            return Ok(Lib { cipher, index, offsets: Vec::new(), base, libu: true, items });
+        }
         if &head[..4] != b"LIBP" {
-            return Err("this Malie archive isn't a LIBP one".into());
+            return Err("this Malie archive isn't a LIBP or LIBU one".into());
         }
         let (count, slots) = (u32_at(&head, 4)? as usize, u32_at(&head, 8)? as usize);
         let index = read_at(f, &cipher, 16, 32 * count)?;
         let offsets = read_at(f, &cipher, 16 + 32 * count as u64, 4 * slots)?;
         let base = 16 + 32 * count as u64 + 4 * slots as u64;
-        let mut lib = Lib { cipher, index, offsets, base: (base + 0x3ff) & !0x3ff, items: Vec::new() };
+        let mut lib = Lib { cipher, index, offsets, base: (base + 0x3ff) & !0x3ff, libu: false, items: Vec::new() };
         lib.walk("", 0, 1)?;
         // games align their data to 1 or 4 KB; only the right one finds a real script
         let script = lib.items.iter().find(|i| is_exec(&i.path)).ok_or("this Malie game has no exec.dat")?;
@@ -311,6 +328,9 @@ impl Lib {
     }
 
     fn place(&self, item: &Item) -> R<u64> {
+        if self.libu {
+            return Ok(u32_at(&self.index, LIBU_ROW * item.entry + 72)? as u64);
+        }
         Ok(self.base + ((u32_at(&self.offsets, 4 * item.slot)? as u64) << 10))
     }
 
@@ -669,9 +689,16 @@ impl Game {
         let mut head = read_at(&mut self.file, cipher, 0, base as usize)?;
         let original = head.clone();
         let at = base + ((self.len - base + 0x3ff) & !0x3ff);
-        let slots = 16 + self.lib.index.len();
-        head[slots + 4 * item.slot..][..4].copy_from_slice(&(((at - base) >> 10) as u32).to_le_bytes());
-        head[16 + 32 * item.entry + 28..][..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        if self.lib.libu {
+            let row = 16 + LIBU_ROW * item.entry;
+            let at = u32::try_from(at).map_err(|_| "this LIBU archive is past 4 GB, where its index can't point")?;
+            head[row + 68..][..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            head[row + 72..][..4].copy_from_slice(&at.to_le_bytes());
+        } else {
+            let slots = 16 + self.lib.index.len();
+            head[slots + 4 * item.slot..][..4].copy_from_slice(&(((at - base) >> 10) as u32).to_le_bytes());
+            head[16 + 32 * item.entry + 28..][..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        }
         let encrypted = |plain: &[u8], from: u64| {
             let mut b = plain.to_vec();
             b.resize((plain.len() + 15) & !15, 0);
@@ -774,6 +801,48 @@ mod tests {
         }
         fs::write(dir.join(DATA), plain).unwrap();
         dir
+    }
+
+    /// An older LIBU archive holding `exec`, after a file before it.
+    fn libu_game(exec: &[u8]) -> PathBuf {
+        let dir = game(exec);
+        let mut plain = b"LIBU\0\0\x01\0\x02\0\0\0\0\0\0\0".to_vec();
+        let entry = |name: &str, size: usize, at: usize| {
+            let mut e = [0u8; LIBU_ROW];
+            for (i, u) in name.encode_utf16().enumerate() {
+                e[2 * i..2 * i + 2].copy_from_slice(&u.to_le_bytes());
+            }
+            e[68..72].copy_from_slice(&(size as u32).to_le_bytes());
+            e[72..76].copy_from_slice(&(at as u32).to_le_bytes());
+            e
+        };
+        let first = 16 + 2 * LIBU_ROW;
+        plain.extend(entry("other.dat", 5, first));
+        plain.extend(entry("data/exec.dat", exec.len(), first + 16));
+        plain.extend(b"hello");
+        plain.resize(first + 16, 0);
+        plain.extend(exec);
+        plain.resize((plain.len() + 15) & !15, 0);
+        let c = Cipher::from_key(KEY);
+        for (i, block) in plain.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            c.encrypt(16 * i as u64, block);
+        }
+        fs::write(dir.join(DATA), plain).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_older_libu_archive_takes_its_translation_too() {
+        let dir = libu_game(&script("こんにちは\u{7}\u{6}", "さようなら\u{7}\u{6}"));
+        assert_eq!(Game::open(&dir).unwrap().lines().unwrap().len(), 2);
+        let line = |k: &str| (k == "0.0").then(|| "Hello.".to_string());
+        assert_eq!(install(&dir, &line, &|_| None).unwrap(), 1);
+        let g = Game::open(&dir).unwrap();
+        let mut f = fs::File::open(dir.join(DATA)).unwrap();
+        let lib = Lib::open(&mut f, g.lib.cipher.clone()).unwrap();
+        assert_eq!(lib.read(&mut f, &lib.items[0]).unwrap(), b"hello", "the file before it stays");
+        let ours = Exec::read(&lib.read(&mut f, &lib.items[1]).unwrap()).unwrap();
+        assert_eq!(ours.messages[0], utf16("Hello.\u{7}\u{6}"));
     }
 
     #[test]

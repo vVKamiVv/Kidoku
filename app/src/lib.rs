@@ -13,6 +13,7 @@ pub mod avif;
 pub mod bgi;
 pub mod blowfish;
 pub mod catsystem;
+pub mod cbg;
 pub mod code;
 pub mod fit;
 pub mod fonts;
@@ -47,6 +48,7 @@ pub mod update;
 pub mod usage;
 pub mod vndb;
 pub mod wolf;
+pub mod xp3;
 pub mod yarn;
 pub mod yuris;
 

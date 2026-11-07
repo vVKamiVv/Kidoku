@@ -508,6 +508,60 @@ fn quoted(text: &str) -> Vec<u8> {
     out
 }
 
+/// Where the second-level key of compilers 110002 and 1110002 lies in the unpacked code.
+const KEYED: std::ops::Range<usize> = 256..1024;
+
+/// Whether a scene's compiler XORs part of its code a second time, with a key of the game's.
+fn second_level(b: &[u8]) -> R<bool> {
+    match word(b, 4)? {
+        10002 => Ok(false),
+        110002 | 1110002 => Ok(true),
+        _ => Err("this RealLive compiler's scenes aren't supported yet".into()),
+    }
+}
+
+/// Undoes, or puts back, the second-level XOR: one key byte for each place in `KEYED`.
+fn apply_key(code: &mut [u8], key: &[u8]) {
+    for (c, k) in code.iter_mut().skip(KEYED.start).zip(key) {
+        *c ^= k;
+    }
+}
+
+/// The second-level key, worked out from the scenes' code: past the keyed part, code bytes have a
+/// steady spread, so each keyed place gets the XOR that makes its bytes across all scenes look most
+/// like that. Ported from CrySirror's `derive_xor2_key` (MPL-2.0).
+fn derive_key(codes: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut counts = [1f64; 256];
+    codes.iter().flat_map(|c| c.iter().skip(KEYED.end)).for_each(|&b| counts[b as usize] += 1.0);
+    let total: f64 = counts.iter().sum();
+    if total < 10_000.0 {
+        return None;
+    }
+    let log_p = counts.map(|c| (c / total).ln());
+    let mut key = vec![0u8; KEYED.len()];
+    for pos in KEYED {
+        let samples: Vec<u8> = codes.iter().filter_map(|c| c.get(pos).copied()).collect();
+        if samples.len() < 16 {
+            break;
+        }
+        let score = |x: u8| samples.iter().map(|&s| log_p[(s ^ x) as usize]).sum::<f64>();
+        let best = (0..=255u8).max_by(|&a, &b| score(a).total_cmp(&score(b)))?;
+        if best != 0 && score(best) - score(0) > 0.5 * samples.len() as f64 {
+            key[pos - KEYED.start] = best;
+        }
+    }
+    if key.iter().all(|&k| k == 0) {
+        return None;
+    }
+    // the key repeats every 16 bytes, so a place between two that agree takes their value
+    for i in 16..key.len() - 16 {
+        if key[i - 16] == key[i + 16] && key[i] != key[i - 16] {
+            key[i] = key[i - 16];
+        }
+    }
+    Some(key)
+}
+
 /// A scene: its header and tables, unpacked code and elements.
 struct Scene {
     number: usize,
@@ -515,21 +569,33 @@ struct Scene {
     code: Vec<u8>,
     elements: Vec<Element>,
     messages: Vec<Message>,
+    keyed: bool,
+    /// Read from its own SEENnnnn.TXT, which the engine takes over SEEN.TXT's.
+    loose: bool,
 }
 
 impl Scene {
-    fn read(number: usize, b: &[u8]) -> R<Scene> {
+    /// The code as stored, under the fixed mask only.
+    fn packed_code(b: &[u8]) -> R<Vec<u8>> {
         if word(b, 0)? != HEADER {
             return Err("not a RealLive scene".into());
         }
-        if word(b, 4)? != 10002 {
-            return Err("this RealLive compiler's scenes aren't supported yet".into());
-        }
         let (at, size) = (word(b, 0x20)?, word(b, 0x24)?);
-        let code = unpack(b.get(at..at + word(b, 0x28)?).ok_or("bad RealLive scene")?, size)?;
+        unpack(b.get(at..at + word(b, 0x28)?).ok_or("bad RealLive scene")?, size)
+    }
+
+    fn read(number: usize, b: &[u8], key: &[u8]) -> R<Scene> {
+        let mut code = Self::packed_code(b)?;
+        let keyed = second_level(b)?;
+        if keyed {
+            if key.is_empty() {
+                return Err("this game's second-level key couldn't be worked out".into());
+            }
+            apply_key(&mut code, key);
+        }
         let elements = walk(&code)?;
         let messages = messages(&code, &elements);
-        Ok(Scene { number, head: b[..at].to_vec(), code, elements, messages })
+        Ok(Scene { number, head: b[..word(b, 0x20)?].to_vec(), code, elements, messages, keyed, loose: false })
     }
 
     fn options(&self) -> Vec<(usize, usize, String)> {
@@ -554,7 +620,7 @@ impl Scene {
     }
 
     /// The scene as a file, with translations in and every jump put right.
-    fn with(&self, width: usize, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> R<(Vec<u8>, usize)> {
+    fn with(&self, width: usize, key: &[u8], line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn(&str) -> Option<String>) -> R<(Vec<u8>, usize)> {
         let mut new: HashMap<usize, Vec<u8>> = HashMap::new();
         let mut done = 0;
         for m in &self.messages {
@@ -608,6 +674,9 @@ impl Scene {
             let target = *moved.get(&old).ok_or(format!("a jump in scene {} lands inside an instruction", self.number))?;
             code[at..at + 4].copy_from_slice(&(target as u32).to_le_bytes());
         }
+        if self.keyed {
+            apply_key(&mut code, key);
+        }
         let packed = stored(&code);
         let mut out = self.head.clone();
         out[0x24..0x28].copy_from_slice(&(code.len() as u32).to_le_bytes());
@@ -622,6 +691,8 @@ impl Scene {
 pub struct Game {
     archive: Vec<u8>,
     scenes: Vec<Scene>,
+    /// The second-level key, empty when no scene needs one.
+    key: Vec<u8>,
     width: usize,
     /// Gameexe.ini, and where the words a player reads are in it.
     settings: String,
@@ -637,6 +708,11 @@ static NOT_SHOWN: LazyLock<Regex> = LazyLock::new(|| Regex::new("$^").unwrap());
 
 fn config_key(start: usize) -> String {
     format!("settings:{start}")
+}
+
+/// A scene the game keeps on its own beside SEEN.TXT.
+fn loose_name(i: usize) -> String {
+    format!("SEEN{i:04}.TXT")
 }
 
 fn toc(b: &[u8], i: usize) -> R<(usize, usize)> {
@@ -656,17 +732,39 @@ fn window(game: &Path) -> usize {
 impl Game {
     pub fn open(game: &Path) -> R<Game> {
         let archive = original(&game.join(ARCHIVE))?;
-        let mut scenes = Vec::new();
+        let mut stored = Vec::new();
         for i in 0..SCENES {
+            let loose = game.join(loose_name(i));
+            if loose.is_file() {
+                stored.push((i, original(&loose)?, true));
+                continue;
+            }
             let (at, size) = toc(&archive, i)?;
             if at != 0 {
-                let b = archive.get(at..at + size).ok_or("bad SEEN.TXT index")?;
-                scenes.push(Scene::read(i, b).map_err(|e| format!("scene {i}: {e}"))?);
+                stored.push((i, archive.get(at..at + size).ok_or("bad SEEN.TXT index")?.to_vec(), false));
             }
+        }
+        let mut key = Vec::new();
+        if stored.iter().any(|(_, b, _)| second_level(b).unwrap_or(false)) {
+            // shortcut: the key is worked out from up to 128 MB of code, plenty for any game seen
+            let (mut codes, mut size) = (Vec::new(), 0);
+            for (_, b, _) in &stored {
+                if size < 128 << 20 && let Ok(c) = Scene::packed_code(b) {
+                    size += c.len();
+                    codes.push(c);
+                }
+            }
+            key = derive_key(&codes).unwrap_or_default();
+        }
+        let mut scenes = Vec::new();
+        for (i, b, loose) in &stored {
+            let mut s = Scene::read(*i, b, &key).map_err(|e| format!("scene {i}: {e}"))?;
+            s.loose = *loose;
+            scenes.push(s);
         }
         let settings = original(&game.join(CONFIG)).map(|b| SHIFT_JIS.decode_without_bom_handling(&b).0.into_owned()).unwrap_or_default();
         let shown = shown_strings(std::slice::from_ref(&settings), &GAMEEXE, &SHOWN, &NOT_SHOWN).into_iter().map(|s| (s.1, s.2)).collect();
-        Ok(Game { archive, scenes, width: window(game), settings, shown })
+        Ok(Game { archive, scenes, key, width: window(game), settings, shown })
     }
 
     pub fn lines(&self) -> Vec<Line> {
@@ -683,21 +781,40 @@ pub fn install(game: &Path, line: &dyn Fn(&str) -> Option<String>, name: &dyn Fn
     let g = Game::open(game)?;
     let mut out = vec![0; 8 * SCENES];
     let mut done = 0;
+    let mut loose = Vec::new();
     for s in &g.scenes {
-        let (new, n) = s.with(g.width, line, name)?;
+        let (new, n) = s.with(g.width, &g.key, line, name)?;
+        done += n;
+        if n > 0 {
+            Scene::read(s.number, &new, &g.key).map_err(|e| format!("scene {} didn't read back: {e}", s.number))?;
+        }
+        if s.loose {
+            if n > 0 {
+                loose.push((s.number, new));
+            }
+            continue;
+        }
         let (at, size) = toc(&g.archive, s.number)?;
         let bytes = if n > 0 { new.as_slice() } else { &g.archive[at..at + size] };
         let place = out.len() as u32;
         out[8 * s.number..8 * s.number + 4].copy_from_slice(&place.to_le_bytes());
         out[8 * s.number + 4..8 * s.number + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend(bytes);
-        done += n;
     }
-    for s in &g.scenes {
-        let (at, size) = toc(&out, s.number)?;
-        Scene::read(s.number, &out[at..at + size]).map_err(|e| format!("scene {} didn't read back: {e}", s.number))?;
+    // a scene in SEEN.TXT that a loose file overrides stays as the game has it
+    for n in (0..SCENES).filter(|&n| g.scenes.iter().any(|s| s.number == n && s.loose)) {
+        let (at, size) = toc(&g.archive, n)?;
+        if at != 0 {
+            let place = out.len() as u32;
+            out[8 * n..8 * n + 4].copy_from_slice(&place.to_le_bytes());
+            out[8 * n + 4..8 * n + 8].copy_from_slice(&(size as u32).to_le_bytes());
+            out.extend(&g.archive[at..at + size]);
+        }
     }
     replace_file(&game.join(ARCHIVE), &out)?;
+    for (n, bytes) in loose {
+        replace_file(&game.join(loose_name(n)), &bytes)?;
+    }
     let (settings, words) = with_english(&g.settings, &g.shown, &|start, _| line(&config_key(start)).map(|t| ascii_punctuation(&t)));
     if words > 0 {
         let (bytes, _, unmapped) = SHIFT_JIS.encode(&settings);
@@ -750,9 +867,13 @@ mod tests {
     }
 
     fn scene(code: &[u8]) -> Vec<u8> {
+        scene_by(10002, code)
+    }
+
+    fn scene_by(compiler: usize, code: &[u8]) -> Vec<u8> {
         let mut b = vec![0; HEADER];
         let packed = stored(code);
-        for (at, v) in [(0, HEADER), (4, 10002), (0x20, HEADER), (0x24, code.len()), (0x28, packed.len())] {
+        for (at, v) in [(0, HEADER), (4, compiler), (0x20, HEADER), (0x24, code.len()), (0x28, packed.len())] {
             b[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
         }
         b.extend(packed);
@@ -830,7 +951,7 @@ mod tests {
 
         let out = fs::read(dir.join(ARCHIVE)).unwrap();
         let (at, size) = toc(&out, 10).unwrap();
-        let s = Scene::read(10, &out[at..at + size]).unwrap();
+        let s = Scene::read(10, &out[at..at + size], &[]).unwrap();
         let text = String::from_utf8_lossy(&s.code).into_owned();
         assert!(text.contains("Hello there") && text.contains("Taro") && text.contains("It says \\\"hi\\\"."));
         assert!(text.contains("\"Yes\"\n") && !text.contains("ASCII"));
@@ -838,6 +959,60 @@ mod tests {
         let target = word(&s.code, 8).unwrap();
         assert_eq!(&s.code[target..target + 3], &line_mark(5)[..]);
         let (at, size) = toc(&out, 20).unwrap();
-        assert_eq!(Scene::read(20, &out[at..at + size]).unwrap().code, sjis("ASCII only"));
+        assert_eq!(Scene::read(20, &out[at..at + size], &[]).unwrap().code, sjis("ASCII only"));
+    }
+
+    #[test]
+    fn the_second_level_key_is_worked_out_from_the_scenes() {
+        let key: Vec<u8> = (0..16).map(|i| 0x31 + i * 7).collect();
+        let mut seed = 7u32;
+        let codes: Vec<Vec<u8>> = (0..24).map(|_| (0..3000).map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            [b'"', 0, 1, b'#', 0x82, 0xa0, b'a', 0x0a][(seed >> 16) as usize % 8]
+        }).collect()).collect();
+        let keyed: Vec<Vec<u8>> = codes.iter().map(|c| {
+            let mut c = c.clone();
+            (256..513).for_each(|i| c[i] ^= key[i % 16]);
+            c
+        }).collect();
+        let found = derive_key(&keyed).unwrap();
+        assert!((0..257).all(|i| found[i] == key[i % 16]), "the keyed part");
+        assert!(found[257..].iter().all(|&k| k == 0), "and nothing past it");
+        let mut back = keyed[0].clone();
+        apply_key(&mut back, &found);
+        assert_eq!(back, codes[0]);
+    }
+
+    #[test]
+    fn a_scene_of_a_newer_compiler_comes_back_under_its_key() {
+        let key: Vec<u8> = (0..KEYED.len()).map(|i| (i * 13 + 5) as u8).collect();
+        let mut plain = code();
+        plain.extend(sjis(&"padding ".repeat(80)));
+        let mut stored_code = plain.clone();
+        apply_key(&mut stored_code, &key);
+        let s = Scene::read(3, &scene_by(110002, &stored_code), &key).unwrap();
+        assert_eq!(s.code, plain);
+        assert!(Scene::read(3, &scene_by(110002, &stored_code), &[]).is_err(), "no key, no reading");
+        let (new, n) = s.with(48, &key, &|_| Some("Yes".into()), &|_| None).unwrap();
+        assert!(n > 0);
+        let back = Scene::read(3, &new, &key).unwrap();
+        assert!(String::from_utf8_lossy(&back.code).contains("\"Yes\""));
+        assert_eq!(word(&new, 4).unwrap(), 110002, "the compiler stays");
+    }
+
+    #[test]
+    fn a_loose_scene_file_is_read_and_written_in_place_of_seen_txt() {
+        let dir = game(&[(10, scene(&sjis("ASCII only")))]);
+        fs::write(dir.join("SEEN0010.TXT"), scene(&code())).unwrap();
+        let lines = Game::open(&dir).unwrap().lines();
+        assert_eq!(lines.len(), 4, "the loose one is what the engine shows");
+        let own = fs::read(dir.join(ARCHIVE)).unwrap();
+        install(&dir, &|_| Some("Yes".into()), &|_| None).unwrap();
+        let loose = fs::read(dir.join("SEEN0010.TXT")).unwrap();
+        assert!(String::from_utf8_lossy(&Scene::read(10, &loose, &[]).unwrap().code).contains("\"Yes\""));
+        let out = fs::read(dir.join(ARCHIVE)).unwrap();
+        let ((a, n), (b, m)) = (toc(&out, 10).unwrap(), toc(&own, 10).unwrap());
+        assert_eq!(out[a..a + n], own[b..b + m], "SEEN.TXT's copy stays as it was");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

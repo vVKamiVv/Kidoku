@@ -1,4 +1,5 @@
-//! BGI/Ethornell engine (data*.arc, BURIKO ARC20): scripts packed with a keyed Huffman and LZ scheme.
+//! BGI/Ethornell engine (data*.arc, BURIKO ARC20 or the older PackFile): scripts packed with a keyed
+//! Huffman and LZ scheme.
 //! Compiled code refers to strings by offset into a block at the end of the script, so new text can
 //! go on the end and only those offsets change.
 
@@ -112,9 +113,36 @@ fn unpack(b: &[u8]) -> R<Vec<u8>> {
     if out.len() != size { Err(BAD.into()) } else { Ok(out) }
 }
 
+/// `BSE 1.0`: a 16-byte header, then the file's first 64 bytes shuffled under a seed.
+const BSE: &[u8] = b"BSE 1.0\0";
+
+/// The file inside a BSE wrapper, which the engine reads as well as the bare file, so ours go in bare.
+fn unwrap_bse(b: &[u8]) -> Option<Vec<u8>> {
+    let mut seed = i32::from_le_bytes(b.get(12..16)?.try_into().ok()?);
+    let mut data = b.get(16..80)?.to_vec();
+    let mut rand = || {
+        let t = ((seed.wrapping_mul(257) >> 8).wrapping_add(seed.wrapping_mul(97)).wrapping_add(23)) as u32 ^ 0xA6CD_9B75;
+        seed = t.rotate_right(16) as i32;
+        (seed & 0x7FFF) as usize
+    };
+    let mut done = [false; 64];
+    for _ in 0..64 {
+        let mut i = rand() % 64;
+        while done[i] {
+            i = (i + 1) % 64;
+        }
+        let (shift, key) = (rand() % 8, rand());
+        let v = data[i].wrapping_sub(rand() as u8);
+        data[i] = if key & 1 == 1 { v.rotate_left(shift as u32) } else { v.rotate_right(shift as u32) };
+        done[i] = true;
+    }
+    let sum = data.iter().fold(0u8, |s, &c| s.wrapping_add(c));
+    let xor = data.iter().fold(0u8, |s, &c| s ^ c);
+    (sum == b[10] && xor == b[11]).then(|| [&data, &b[80..]].concat())
+}
+
 // ---------- archives ----------
 
-const ROW: usize = 0x80;
 const TOP: usize = 0x10;
 
 /// One file of an archive.
@@ -127,6 +155,8 @@ pub struct Item {
 
 pub struct Archive {
     path: PathBuf,
+    /// Where a row's place and size sit: after the name, 0x60 bytes in ARC20 and 0x10 in PackFile.
+    name_len: usize,
     head: Vec<u8>,
     len: u64,
     pub items: Vec<Item>,
@@ -149,27 +179,33 @@ impl Archive {
         let len = f.metadata().map_err(err)?.len();
         let mut top = [0; TOP];
         f.read_exact(&mut top).map_err(err)?;
-        if &top[..12] != b"BURIKO ARC20" {
-            return Ok(None);
-        }
+        let (row_len, name_len) = match &top[..12] {
+            b"BURIKO ARC20" => (0x80, 0x60),
+            b"PackFile    " => (0x20, 0x10),
+            _ => return Ok(None),
+        };
         let count = word(&top, 12)?;
+        let base = TOP + row_len * count;
+        if base as u64 > len {
+            return Err(format!("{}: the archive's index runs past its end", path.display()));
+        }
         let mut head = top.to_vec();
-        head.resize(TOP + ROW * count, 0);
+        head.resize(base, 0);
         f.read_exact(&mut head[TOP..]).map_err(err)?;
-        let base = TOP + ROW * count;
         let mut items = Vec::with_capacity(count);
         for i in 0..count {
-            let row = TOP + ROW * i;
-            let raw = &head[row..row + 0x60];
-            let name = SHIFT_JIS.decode_without_bom_handling(&raw[..raw.iter().position(|&c| c == 0).unwrap_or(0x60)]).0.into_owned();
-            items.push(Item { name, row, place: base + word(&head, row + 0x60)?, size: word(&head, row + 0x64)? });
+            let row = TOP + row_len * i;
+            let raw = &head[row..row + name_len];
+            let name = SHIFT_JIS.decode_without_bom_handling(&raw[..raw.iter().position(|&c| c == 0).unwrap_or(name_len)]).0.into_owned();
+            items.push(Item { name, row, place: base + word(&head, row + name_len)?, size: word(&head, row + name_len + 4)? });
         }
-        Ok(Some(Archive { path: path.to_path_buf(), head, len, items }))
+        Ok(Some(Archive { path: path.to_path_buf(), name_len, head, len, items }))
     }
 
     fn file(&self, f: &mut fs::File, item: &Item) -> R<Vec<u8>> {
         let mut b = vec![0; item.size];
         f.seek(SeekFrom::Start(item.place as u64)).and_then(|_| f.read_exact(&mut b)).map_err(|e| format!("{}: {e}", item.name))?;
+        let b = if b.starts_with(BSE) { unwrap_bse(&b).ok_or(format!("{}: bad BSE header", item.name))? } else { b };
         if b.starts_with(b"DSC FORMAT 1.00") { unpack(&b) } else { Ok(b) }
     }
 
@@ -178,9 +214,9 @@ impl Archive {
         let mut head = self.head.clone();
         let (mut tail, mut place) = (Vec::new(), self.len as usize - self.head.len());
         for (i, bytes) in new {
-            let row = self.items[*i].row;
-            head[row + 0x60..row + 0x64].copy_from_slice(&(place as u32).to_le_bytes());
-            head[row + 0x64..row + 0x68].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            let at = self.items[*i].row + self.name_len;
+            head[at..at + 4].copy_from_slice(&(place as u32).to_le_bytes());
+            head[at + 4..at + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
             tail.extend(bytes);
             place += bytes.len();
         }
@@ -195,6 +231,17 @@ const PUSH_STRING: u32 = 3;
 const PUSH_FIRST: u32 = 0;
 const PUSH_LAST: u32 = 3;
 const MESSAGE: u32 = 0x140;
+/// The largest file looked at as a script without a header.
+const HEADERLESS_MAX: usize = 16 << 20;
+
+/// Whether a file's first bytes could start a script without a header: an instruction, and not
+/// the start of a sound (`bw  `).
+fn maybe_code(top: &[u8]) -> bool {
+    word(top, 0).is_ok_and(|op| op < 0x400) && top.get(4..8) != Some(b"bw  ")
+}
+
+/// The engine's selection calls, which take the choices' texts.
+const CHOICES: std::ops::Range<u32> = 0x160..0x180;
 // shortcut: the text box isn't in the files; the game's longest lines suggest about 28 full-width characters
 const LINE_LETTERS: usize = 56;
 
@@ -230,6 +277,19 @@ fn opcode(b: &[u8], p: usize) -> u32 {
 impl Script {
     fn read(archive: usize, item: usize, name: String, plain: Vec<u8>) -> R<Script> {
         let base = MAGIC.len() + word(&plain, MAGIC.len())?;
+        Ok(Self::parse(archive, item, name, plain, base))
+    }
+
+    /// Older games' scripts have no header and start with code. Taken only if it has messages, since
+    /// nothing else marks a file as one.
+    fn headerless(archive: usize, item: usize, name: String, plain: Vec<u8>) -> Option<Script> {
+        let s = Self::parse(archive, item, name, plain, 0);
+        let mut lines = Vec::new();
+        s.lines(&mut lines);
+        (!lines.is_empty()).then_some(s)
+    }
+
+    fn parse(archive: usize, item: usize, name: String, plain: Vec<u8>, base: usize) -> Script {
         // code has runs of zeros, and text doesn't
         let mut end = plain.len();
         while end >= 3 && plain[end - 3..end] != [0, 0, 0] {
@@ -259,13 +319,15 @@ impl Script {
                         Some(first) => messages.extend([first, strings[1]].map(|text| Message { text, name: None })),
                         None => messages.push(Message { text: strings[text_at], name }),
                     }
+                } else if CHOICES.contains(&opcode(&plain, p + 8)) {
+                    messages.extend(strings.iter().map(|&text| Message { text, name: None }));
                 }
                 i = p + 8;
             } else {
                 i += 4;
             }
         }
-        Ok(Script { archive, item, name, plain, base, messages })
+        Script { archive, item, name, plain, base, messages }
     }
 
     fn string(&self, push: usize) -> String {
@@ -452,8 +514,12 @@ impl Program {
 const PICTURES: &str = "sysgrp.arc";
 
 /// A picture as BGI stores it: width, height and bits per pixel (24 or 32) in a 16-byte header, then
-/// BGR(A) rows from the top.
+/// BGR(A) rows from the top; or compressed (CBG).
 pub fn picture(b: &[u8]) -> Option<Image> {
+    if let Some((w, h, bpp, bgra)) = crate::cbg::decode(b) {
+        let px = bgra.as_chunks::<4>().0.iter().map(|&[b, g, r, a]| u32::from_le_bytes([b, g, r, 255 - a])).collect();
+        return (bpp == 24 || bpp == 32).then_some(Image { w, h, px });
+    }
     let half = |p: usize| u16::from_le_bytes([b[p], b[p + 1]]) as usize;
     if b.len() < 16 || b[6..16].iter().any(|&c| c != 0) {
         return None;
@@ -468,8 +534,13 @@ pub fn picture(b: &[u8]) -> Option<Image> {
     Some(Image { w, h, px })
 }
 
-/// `img` stored as `like` is: the same header, so the same bits per pixel.
+/// `img` stored as `like` is: the same header, so the same bits per pixel. A compressed picture goes
+/// back compressed, as version 1.
 pub fn bitmap(like: &[u8], img: &Image) -> Vec<u8> {
+    if let Some((_, _, bpp, _)) = crate::cbg::decode(like) {
+        let bgra: Vec<u8> = img.px.iter().flat_map(|p| { let [b, g, r, a] = p.to_le_bytes(); [b, g, r, 255 - a] }).collect();
+        return crate::cbg::encode(img.w, img.h, bpp, &bgra);
+    }
     let step = like[4] as usize / 8;
     let mut out = like[..16].to_vec();
     for p in &img.px {
@@ -521,11 +592,15 @@ impl Game {
             for (i, item) in a.items.iter().enumerate() {
                 let mut top = [0; 16];
                 f.seek(SeekFrom::Start(item.place as u64)).and_then(|_| f.read_exact(&mut top)).map_err(|e| e.to_string())?;
-                if top.starts_with(b"DSC FORMAT 1.00") || top.starts_with(&MAGIC[..16]) {
-                    let plain = a.file(&mut f, item).map_err(|e| format!("{}: {e}", item.name))?;
-                    if plain.starts_with(MAGIC) {
-                        scripts.push(Script::read(archives.len(), i, item.name.clone(), plain)?);
-                    }
+                let wrapped = top.starts_with(b"DSC FORMAT 1.00") || top.starts_with(BSE);
+                if !wrapped && !top.starts_with(&MAGIC[..16]) && (item.size > HEADERLESS_MAX || !maybe_code(&top)) {
+                    continue;
+                }
+                let plain = a.file(&mut f, item).map_err(|e| format!("{}: {e}", item.name))?;
+                if plain.starts_with(MAGIC) {
+                    scripts.push(Script::read(archives.len(), i, item.name.clone(), plain)?);
+                } else if plain.len() <= HEADERLESS_MAX && plain.get(..16).is_some_and(maybe_code) {
+                    scripts.extend(Script::headerless(archives.len(), i, item.name.clone(), plain));
                 }
             }
             archives.push(a);
@@ -624,19 +699,124 @@ mod tests {
     }
 
     fn archive(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let mut out = b"BURIKO ARC20".to_vec();
+        archive_as(b"BURIKO ARC20", 0x80, 0x60, files)
+    }
+
+    fn packfile(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        archive_as(b"PackFile    ", 0x20, 0x10, files)
+    }
+
+    fn archive_as(magic: &[u8], row_len: usize, name_len: usize, files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut out = magic.to_vec();
         out.extend((files.len() as u32).to_le_bytes());
         let mut place = 0u32;
         for (name, b) in files {
-            let mut row = [0u8; ROW];
+            let mut row = vec![0u8; row_len];
             row[..name.len()].copy_from_slice(name.as_bytes());
-            row[0x60..0x64].copy_from_slice(&place.to_le_bytes());
-            row[0x64..0x68].copy_from_slice(&(b.len() as u32).to_le_bytes());
+            row[name_len..name_len + 4].copy_from_slice(&place.to_le_bytes());
+            row[name_len + 4..name_len + 8].copy_from_slice(&(b.len() as u32).to_le_bytes());
             out.extend(row);
             place += b.len() as u32;
         }
         files.iter().for_each(|(_, b)| out.extend(b));
         out
+    }
+
+    /// `plain` in a BSE wrapper: each of the 64 shuffled bytes undone in the engine's order.
+    fn bse(plain: &[u8], seed: i32) -> Vec<u8> {
+        let mut data = plain[..64].to_vec();
+        let mut s = seed;
+        let mut rand = || {
+            let t = ((s.wrapping_mul(257) >> 8).wrapping_add(s.wrapping_mul(97)).wrapping_add(23)) as u32 ^ 0xA6CD_9B75;
+            s = t.rotate_right(16) as i32;
+            (s & 0x7FFF) as usize
+        };
+        let mut done = [false; 64];
+        for _ in 0..64 {
+            let mut i = rand() % 64;
+            while done[i] {
+                i = (i + 1) % 64;
+            }
+            let (shift, key, add) = (rand() % 8, rand(), rand() as u8);
+            let v = if key & 1 == 1 { data[i].rotate_right(shift as u32) } else { data[i].rotate_left(shift as u32) };
+            data[i] = v.wrapping_add(add);
+            done[i] = true;
+        }
+        let sum = plain[..64].iter().fold(0u8, |a, &c| a.wrapping_add(c));
+        let xor = plain[..64].iter().fold(0u8, |a, &c| a ^ c);
+        [BSE, &[0, 0, sum, xor], &seed.to_le_bytes(), &data, &plain[64..]].concat()
+    }
+
+    #[test]
+    fn an_older_packfile_archive_takes_its_translation_too() {
+        let dir = game(&[]);
+        fs::write(dir.join("data01000.arc"), packfile(&[("a", script())])).unwrap();
+        let lines = Game::open(&dir).unwrap().lines();
+        assert_eq!(lines.len(), 2);
+        let key = lines[0].0.clone();
+        assert_eq!(install(&dir, &|k| (k == key).then(|| "Hi".to_string()), &|_| None).unwrap(), 1);
+        let a = Archive::open_as_written(&dir.join("data01000.arc")).unwrap();
+        let s = Script::read(0, 0, "a".into(), a.file(&mut fs::File::open(dir.join("data01000.arc")).unwrap(), &a.items[0]).unwrap()).unwrap();
+        assert_eq!(s.string(s.messages[0].text), "Hi");
+    }
+
+    #[test]
+    fn a_file_in_a_bse_wrapper_is_read_and_written_back_bare() {
+        let own = script();
+        let wrapped = bse(&own, 0x1234_5678);
+        assert_ne!(wrapped[16..80], own[..64]);
+        assert_eq!(unwrap_bse(&wrapped).unwrap(), own);
+        let dir = game(&[("a", wrapped)]);
+        let key = Game::open(&dir).unwrap().lines()[0].0.clone();
+        install(&dir, &|k| (k == key).then(|| "Hi".to_string()), &|_| None).unwrap();
+        let a = Archive::open_as_written(&dir.join("data01000.arc")).unwrap();
+        let back = a.file(&mut fs::File::open(dir.join("data01000.arc")).unwrap(), &a.items[0]).unwrap();
+        assert!(back.starts_with(MAGIC), "stored bare");
+    }
+
+    #[test]
+    fn a_script_without_a_header_is_found_by_its_messages_and_a_picture_is_not() {
+        let with_header = script();
+        let bare = with_header[MAGIC.len() + 4..].to_vec();
+        let mut picture = [4u16, 1, 24].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        picture.extend([0; 10]);
+        picture.extend([7; 12]);
+        let dir = game(&[("old", bare), ("pic", picture)]);
+        let lines = Game::open(&dir).unwrap().lines();
+        assert_eq!(lines.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(), ["こんにちは", "地の文です"]);
+        let key = lines[1].0.clone();
+        install(&dir, &|k| (k == key).then(|| "Narration".to_string()), &|_| None).unwrap();
+        let a = Archive::open_as_written(&dir.join("data01000.arc")).unwrap();
+        let s = Script::headerless(0, 0, "old".into(), a.file(&mut fs::File::open(dir.join("data01000.arc")).unwrap(), &a.items[0]).unwrap()).unwrap();
+        assert_eq!(s.string(s.messages[1].text), "Narration");
+    }
+
+    #[test]
+    fn choices_given_to_a_selection_call_are_lines() {
+        let strings = ["右へ行く", "左へ行く", "sel01"];
+        let (mut block, mut at) = (Vec::new(), Vec::new());
+        for t in strings {
+            at.push(block.len() as u32);
+            block.extend(sjis(t));
+            block.push(0);
+        }
+        let code: Vec<u32> = vec![3, at[0], 3, at[1], 3, at[2], 0, 2, 0x160, 0, 0, 0];
+        let shift = (code.len() * 4) as u32;
+        let code: Vec<u8> = code.iter().enumerate().flat_map(|(i, w)| (if [1, 3, 5].contains(&i) { w + shift } else { *w }).to_le_bytes()).collect();
+        let s = Script::read(0, 0, "a".into(), [MAGIC, &4u32.to_le_bytes(), &code, &block].concat()).unwrap();
+        let mut lines = Vec::new();
+        s.lines(&mut lines);
+        assert_eq!(lines.iter().map(|l| (l.1.as_deref(), l.2.as_str())).collect::<Vec<_>>(), [(None, strings[0]), (None, strings[1])]);
+    }
+
+    #[test]
+    fn a_compressed_menu_picture_is_repainted_and_stays_compressed() {
+        let own = crate::cbg::encode(2, 1, 32, &[1, 2, 3, 255, 4, 5, 6, 0]);
+        let img = picture(&own).unwrap();
+        assert_eq!(img.px, [0x00_03_02_01, 0xff_06_05_04], "BGRA, alpha turned to the app's way");
+        let new = bitmap(&own, &Image { w: 2, h: 1, px: vec![0x00_10_20_30, 0x00_40_50_60] });
+        assert!(new.starts_with(b"CompressedBG___"));
+        assert_eq!(picture(&new).unwrap().px, [0x00_10_20_30, 0x00_40_50_60]);
     }
 
     fn game(files: &[(&str, Vec<u8>)]) -> PathBuf {
